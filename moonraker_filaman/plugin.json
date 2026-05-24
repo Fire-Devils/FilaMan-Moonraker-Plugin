@@ -1,0 +1,92 @@
+{
+  "plugin_key": "moonraker_filaman",
+  "name": "Moonraker FilaMan",
+  "driver_key": "moonraker_filaman",
+  "plugin_type": "driver",
+  "version": "0.2.1",
+  "description": "Driver that sends spool assignments from FilaMan to Moonraker's filaman component. Supports toolhead assignment and optional macro-based tray targets.",
+  "author": "FilaMan",
+  "homepage": "https://www.filaman.app",
+  "dependencies": ["aiohttp>=3.9.0,<4"],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "moonraker_url": {
+        "type": "string",
+        "title": "Moonraker URL",
+        "description": "Base URL of Moonraker, e.g. http://192.168.1.20:7125"
+      },
+      "api_key": {
+        "type": "string",
+        "title": "Moonraker API Key",
+        "description": "Optional API key for authenticated Moonraker instances"
+      },
+      "mode": {
+        "type": "string",
+        "title": "Assignment Mode",
+        "description": "toolhead_only sets the active spool in Moonraker. tray_macros additionally runs tray macros per slot.",
+        "enum": ["toolhead_only", "tray_macros"],
+        "default": "toolhead_only"
+      },
+      "request_timeout_seconds": {
+        "type": "integer",
+        "title": "Request Timeout (seconds)",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 120
+      },
+      "slot_targets": {
+        "type": "array",
+        "title": "Tray Targets",
+        "description": "Optional tray target definitions used for UI and tray_macros mode",
+        "items": {
+          "type": "object",
+          "properties": {
+            "slot_index": {
+              "type": "string",
+              "title": "Slot Index",
+              "description": "Unique slot id like 0-0, 0-1, toolhead"
+            },
+            "slot_name": {
+              "type": "string",
+              "title": "Slot Name",
+              "description": "Display label for this slot"
+            },
+            "assign_gcode": {
+              "type": "string",
+              "title": "Assign GCode",
+              "description": "Optional macro/GCode command. Supports placeholders: {spool_id}, {slot_index}, {ams_id}, {tray_id}, {material_type}, {color}"
+            },
+            "default_material_type": {
+              "type": "string",
+              "title": "Default Material",
+              "default": "PLA"
+            },
+            "default_color": {
+              "type": "string",
+              "title": "Default Color",
+              "default": "FFFFFF"
+            }
+          },
+          "required": ["slot_index", "slot_name"]
+        },
+        "default": []
+      },
+      "slot_count": {
+        "type": "integer",
+        "title": "Virtual Slot Count",
+        "description": "If no slot_targets are configured, this many virtual slots are shown",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 32
+      }
+    },
+    "required": ["moonraker_url"]
+  },
+  "capabilities": {
+    "has_slots": true,
+    "has_rfid": false,
+    "has_ams": true,
+    "supports_auto_match": true
+  }
+}
