@@ -7,9 +7,20 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from sqlalchemy import select
+
+from app.core.database import async_session_maker
+from app.models.location import Location
+from app.models.printer import Printer
+from app.models.printer_params import SpoolPrinterParam
+from app.models.spool import Spool
 from app.plugins.base import BaseDriver
+from app.services.spool_service import SpoolService
 
 logger = logging.getLogger(__name__)
+
+_ORIGINAL_LOCATION_PARAM_KEY = "moonraker_original_location_id"
+_NONE_LOCATION_SENTINEL = "__none__"
 
 
 def _now_iso() -> str:
@@ -49,6 +60,10 @@ class Driver(BaseDriver):
             1, self._discovery_interval_seconds // self._status_poll_interval
         )
         self._poll_ticks = 0
+        self._slot_to_filaman_spool: dict[str, int] = {}
+        self._spool_original_location: dict[int, int | None] = {}
+        self._spool_original_known: set[int] = set()
+        self._printer_name: str | None = None
 
     def _emit_slots_update(self) -> None:
         self.emit(
@@ -430,9 +445,339 @@ class Driver(BaseDriver):
             ],
         }
 
+    async def _load_printer_name(self) -> None:
+        try:
+            async with async_session_maker() as db:
+                printer = await db.get(Printer, self.printer_id)
+                if printer and printer.name:
+                    self._printer_name = str(printer.name).strip()
+                else:
+                    self._printer_name = f"Printer {self.printer_id}"
+        except Exception as exc:
+            logger.warning(
+                "Could not load printer name for moonraker printer %s: %s",
+                self.printer_id,
+                exc,
+            )
+            self._printer_name = f"Printer {self.printer_id}"
+
+    @staticmethod
+    def _location_value_to_param(location_id: int | None) -> str:
+        if location_id is None:
+            return _NONE_LOCATION_SENTINEL
+        return str(location_id)
+
+    @staticmethod
+    def _location_param_to_value(raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        if not value or value == _NONE_LOCATION_SENTINEL:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    async def _load_original_location_cache(self) -> None:
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam).where(
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == _ORIGINAL_LOCATION_PARAM_KEY,
+                    )
+                )
+                params = result.scalars().all()
+                for param in params:
+                    self._spool_original_known.add(param.spool_id)
+                    self._spool_original_location[param.spool_id] = (
+                        self._location_param_to_value(param.param_value)
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Could not restore original spool locations for printer %s: %s",
+                self.printer_id,
+                exc,
+            )
+
+    async def _store_original_location_db(
+        self,
+        spool_id: int,
+        location_id: int | None,
+    ) -> None:
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam)
+                    .where(
+                        SpoolPrinterParam.spool_id == spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == _ORIGINAL_LOCATION_PARAM_KEY,
+                    )
+                    .limit(1)
+                )
+                existing = result.scalars().first()
+                param_value = self._location_value_to_param(location_id)
+
+                if existing:
+                    existing.param_value = param_value
+                else:
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=spool_id,
+                            printer_id=self.printer_id,
+                            param_key=_ORIGINAL_LOCATION_PARAM_KEY,
+                            param_value=param_value,
+                        )
+                    )
+
+                await db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist original location for spool %s: %s",
+                spool_id,
+                exc,
+            )
+
+    async def _delete_original_location_db(self, spool_id: int) -> None:
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam)
+                    .where(
+                        SpoolPrinterParam.spool_id == spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == _ORIGINAL_LOCATION_PARAM_KEY,
+                    )
+                    .limit(1)
+                )
+                existing = result.scalars().first()
+                if not existing:
+                    return
+                await db.delete(existing)
+                await db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to delete original location for spool %s: %s",
+                spool_id,
+                exc,
+            )
+
+    async def _cache_original_location(self, spool_id: int) -> None:
+        if spool_id in self._spool_original_known:
+            return
+
+        location_id: int | None = None
+        try:
+            async with async_session_maker() as db:
+                result = await db.execute(
+                    select(SpoolPrinterParam)
+                    .where(
+                        SpoolPrinterParam.spool_id == spool_id,
+                        SpoolPrinterParam.printer_id == self.printer_id,
+                        SpoolPrinterParam.param_key == _ORIGINAL_LOCATION_PARAM_KEY,
+                    )
+                    .limit(1)
+                )
+                existing = result.scalars().first()
+
+                if existing:
+                    location_id = self._location_param_to_value(existing.param_value)
+                else:
+                    spool = await db.get(Spool, spool_id)
+                    if spool is None:
+                        logger.warning(
+                            "Could not cache original location, spool %s not found",
+                            spool_id,
+                        )
+                        return
+                    location_id = spool.location_id
+                    db.add(
+                        SpoolPrinterParam(
+                            spool_id=spool_id,
+                            printer_id=self.printer_id,
+                            param_key=_ORIGINAL_LOCATION_PARAM_KEY,
+                            param_value=self._location_value_to_param(location_id),
+                        )
+                    )
+                    await db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to cache original location for spool %s: %s",
+                spool_id,
+                exc,
+            )
+            return
+
+        self._spool_original_known.add(spool_id)
+        self._spool_original_location[spool_id] = location_id
+
+    def _slot_location_identifier(self, slot_index: str) -> str:
+        safe_slot = re.sub(r"[^A-Za-z0-9_-]", "_", slot_index).strip("_")
+        if not safe_slot:
+            safe_slot = "slot"
+        return f"moonraker_{self.printer_id}_{safe_slot}"[:100]
+
+    def _slot_display_name(self, slot_index: str) -> str:
+        slot = next(
+            (item for item in self._slots if item.get("slot_index") == slot_index),
+            None,
+        )
+        if slot and slot.get("slot_name"):
+            return str(slot["slot_name"])
+        return slot_index
+
+    def _slot_location_name(self, slot_index: str) -> str:
+        printer_name = self._printer_name or f"Printer {self.printer_id}"
+        slot_name = self._slot_display_name(slot_index)
+        return f"{printer_name} - {slot_name}"
+
+    def _find_slot_for_spool(self, spool_id: int) -> str | None:
+        for slot_index, mapped_spool_id in self._slot_to_filaman_spool.items():
+            if mapped_spool_id == spool_id:
+                return slot_index
+        return None
+
+    def _active_slot_index(self) -> str:
+        for slot in self._slots:
+            if str(slot.get("slot_kind") or "").lower() == "toolhead":
+                return str(slot.get("slot_index") or "0-0")
+
+        for slot in self._slots:
+            if str(slot.get("slot_index") or "") == "0-0":
+                return "0-0"
+
+        if self._slots:
+            return str(self._slots[0].get("slot_index") or "0-0")
+
+        return "0-0"
+
+    async def _move_spool_to_slot_location(self, spool_id: int, slot_index: str) -> None:
+        slot_location_name = self._slot_location_name(slot_index)
+        slot_location_identifier = self._slot_location_identifier(slot_index)
+
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, spool_id)
+                if spool is None:
+                    logger.warning(
+                        "Spool %s not found while updating Moonraker location",
+                        spool_id,
+                    )
+                    return
+
+                result = await db.execute(
+                    select(Location)
+                    .where(Location.identifier == slot_location_identifier)
+                    .order_by(Location.id.asc())
+                    .limit(1)
+                )
+                location = result.scalars().first()
+
+                location_changed = False
+                desired_custom_fields = {
+                    "managed_by": "moonraker_filaman",
+                    "printer_id": self.printer_id,
+                    "slot_index": slot_index,
+                }
+
+                if location is None:
+                    location = Location(
+                        name=slot_location_name,
+                        identifier=slot_location_identifier,
+                        custom_fields=desired_custom_fields,
+                    )
+                    db.add(location)
+                    await db.flush()
+                    location_changed = True
+                else:
+                    if location.name != slot_location_name:
+                        location.name = slot_location_name
+                        location_changed = True
+
+                    if location.identifier != slot_location_identifier:
+                        location.identifier = slot_location_identifier
+                        location_changed = True
+
+                    merged_custom_fields = {
+                        **(location.custom_fields or {}),
+                        **desired_custom_fields,
+                    }
+                    if merged_custom_fields != (location.custom_fields or {}):
+                        location.custom_fields = merged_custom_fields
+                        location_changed = True
+
+                if location.id is None:
+                    logger.warning(
+                        "Moonraker slot location has no id for printer %s slot %s",
+                        self.printer_id,
+                        slot_index,
+                    )
+                    return
+
+                if spool.location_id == location.id:
+                    if location_changed:
+                        await db.commit()
+                    return
+
+                await SpoolService(db).move_location(
+                    spool,
+                    location.id,
+                    datetime.now(timezone.utc),
+                    source="driver",
+                    note=f"Assigned to {slot_location_name}",
+                )
+        except Exception as exc:
+            logger.error(
+                "Failed to move spool %s to Moonraker slot %s: %s",
+                spool_id,
+                slot_index,
+                exc,
+                exc_info=True,
+            )
+
+    async def _restore_spool_location(self, spool_id: int) -> None:
+        if spool_id not in self._spool_original_known:
+            return
+
+        if spool_id in self._slot_to_filaman_spool.values():
+            return
+
+        original_location_id = self._spool_original_location.get(spool_id)
+
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, spool_id)
+                if spool is None:
+                    logger.warning(
+                        "Spool %s not found while restoring Moonraker location",
+                        spool_id,
+                    )
+                elif spool.location_id != original_location_id:
+                    await SpoolService(db).move_location(
+                        spool,
+                        original_location_id,
+                        datetime.now(timezone.utc),
+                        source="driver",
+                        note="Removed from Moonraker slot",
+                    )
+
+            await self._delete_original_location_db(spool_id)
+            self._spool_original_known.discard(spool_id)
+            self._spool_original_location.pop(spool_id, None)
+        except Exception as exc:
+            logger.warning(
+                "Failed to restore original location for spool %s: %s",
+                spool_id,
+                exc,
+            )
+
     async def start(self) -> None:
         self._validate_url()
         self._running = True
+        await self._load_printer_name()
+        await self._load_original_location_cache()
 
         if self._mode == "tray_macros" and not self._slot_targets:
             logger.warning(
@@ -453,6 +798,15 @@ class Driver(BaseDriver):
             self._last_error = str(exc)
 
         await self._refresh_slots(emit=False)
+
+        if self._active_spool_id is not None:
+            target_slot_index = self._active_slot_index()
+            await self._cache_original_location(self._active_spool_id)
+            await self._move_spool_to_slot_location(
+                self._active_spool_id,
+                target_slot_index,
+            )
+            self._slot_to_filaman_spool[target_slot_index] = self._active_spool_id
 
         self._emit_slots_update()
         self._poll_task = asyncio.create_task(self._poll_status_loop())
@@ -509,6 +863,34 @@ class Driver(BaseDriver):
         self._last_success_at = result.get("last_success_at") or _now_iso()
 
         if previous_spool_id != self._active_spool_id:
+            async with self._lock:
+                if previous_spool_id is not None:
+                    previous_slot_index = self._find_slot_for_spool(previous_spool_id)
+                    if previous_slot_index:
+                        self._slot_to_filaman_spool.pop(previous_slot_index, None)
+                    await self._restore_spool_location(previous_spool_id)
+
+                if self._active_spool_id is not None:
+                    target_slot_index = self._active_slot_index()
+                    old_slot_for_active = self._find_slot_for_spool(self._active_spool_id)
+                    if old_slot_for_active and old_slot_for_active != target_slot_index:
+                        self._slot_to_filaman_spool.pop(old_slot_for_active, None)
+
+                    replaced_spool_id = self._slot_to_filaman_spool.get(target_slot_index)
+                    if (
+                        replaced_spool_id is not None
+                        and replaced_spool_id != self._active_spool_id
+                    ):
+                        self._slot_to_filaman_spool.pop(target_slot_index, None)
+                        await self._restore_spool_location(replaced_spool_id)
+
+                    await self._cache_original_location(self._active_spool_id)
+                    await self._move_spool_to_slot_location(
+                        self._active_spool_id,
+                        target_slot_index,
+                    )
+                    self._slot_to_filaman_spool[target_slot_index] = self._active_spool_id
+
             self._emit_slots_update()
 
         return {
@@ -543,6 +925,16 @@ class Driver(BaseDriver):
             raise ValueError(f"Unknown slot index '{slot_index}'")
 
         async with self._lock:
+            old_slot_for_spool = self._find_slot_for_spool(spool_id)
+            if old_slot_for_spool and old_slot_for_spool != slot_index:
+                self._slot_to_filaman_spool.pop(old_slot_for_spool, None)
+
+            replaced_spool_id = self._slot_to_filaman_spool.get(slot_index)
+            if replaced_spool_id is not None and replaced_spool_id != spool_id:
+                self._slot_to_filaman_spool.pop(slot_index, None)
+                await self._restore_spool_location(replaced_spool_id)
+
+            await self._cache_original_location(spool_id)
             await self._set_moonraker_active_spool(spool_id)
             await self._execute_assign_macro(
                 spool_id=spool_id,
@@ -552,6 +944,8 @@ class Driver(BaseDriver):
                 filament_data=filament_data,
             )
             await self._mark_slot(slot_index, filament_data)
+            await self._move_spool_to_slot_location(spool_id, slot_index)
+            self._slot_to_filaman_spool[slot_index] = spool_id
 
     async def assign_pending_spool(
         self,
@@ -597,6 +991,8 @@ class Driver(BaseDriver):
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "slot_count": len(self._slots),
+            "printer_name": self._printer_name,
             "slots": self._slots,
             "ams_info": self._build_ams_info(),
+            "tracked_slot_spools": self._slot_to_filaman_spool,
         }
