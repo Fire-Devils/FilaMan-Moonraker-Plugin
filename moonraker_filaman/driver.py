@@ -275,8 +275,9 @@ class Driver(BaseDriver):
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._api_key:
+            # Only X-Api-Key: Moonraker treats Authorization: Bearer as a JWT and
+            # fails to decode a plain API key, returning a false 401.
             headers["X-Api-Key"] = self._api_key
-            headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
     def _validate_url(self) -> None:
