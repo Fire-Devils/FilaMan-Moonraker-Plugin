@@ -113,6 +113,7 @@ class Driver(BaseDriver):
                 "tray_type": "",
                 "tray_color": "",
                 "present": False,
+                "spool_id": None,
             }
             for idx in range(max(1, self._slot_count))
         ]
@@ -133,6 +134,46 @@ class Driver(BaseDriver):
             return int(parts[0]), int(parts[1])
         except Exception:
             return 0, 0
+
+    def _slot_extruder(self, slot: dict[str, Any] | None) -> str | None:
+        """Klipper extruder name for a toolhead slot; None for tray slots."""
+        if not slot or str(slot.get("slot_kind") or "") != "toolhead":
+            return None
+        name = str(slot.get("toolhead_name") or "").strip()
+        if name:
+            return name
+        _unit, idx = self._slot_to_ids(str(slot.get("slot_index", "0-0")))
+        return "extruder" if idx == 0 else f"extruder{idx}"
+
+    def _find_slot(self, slot_index: str) -> dict[str, Any] | None:
+        return next(
+            (item for item in self._slots if item.get("slot_index") == slot_index),
+            None,
+        )
+
+    def _apply_extruder_spools(self, extruder_spools: dict[str, Any]) -> bool:
+        """Mirror Moonraker's per-extruder spool map onto the toolhead slots."""
+        changed = False
+        for slot in self._slots:
+            extruder = self._slot_extruder(slot)
+            if extruder is None or extruder not in extruder_spools:
+                continue
+
+            raw = extruder_spools.get(extruder)
+            spool_id: int | None = None
+            if raw is not None and not isinstance(raw, bool):
+                with contextlib.suppress(TypeError, ValueError):
+                    spool_id = int(raw)
+
+            if slot.get("spool_id") == spool_id:
+                continue
+
+            slot["spool_id"] = spool_id
+            slot["present"] = spool_id is not None
+            if spool_id is None:
+                slot.update({"tray_type": "", "tray_color": "", "tray_info_idx": ""})
+            changed = True
+        return changed
 
     async def _discover_objects(self) -> list[str]:
         payload = await self._request("GET", "/printer/objects/list")
@@ -203,6 +244,7 @@ class Driver(BaseDriver):
                     "tray_type": "",
                     "tray_color": "",
                     "present": False,
+                    "spool_id": None,
                 }
             )
 
@@ -247,6 +289,9 @@ class Driver(BaseDriver):
                 for key in ("tray_info_idx", "tray_type", "tray_color", "present"):
                     if old_slot.get(key) not in (None, "", False):
                         slot[key] = old_slot[key]
+                # Carried over unconditionally: None is a meaningful value here
+                # (slot explicitly unassigned), unlike the tray metadata above.
+                slot["spool_id"] = old_slot.get("spool_id")
             merged.append(slot)
 
         changed = [slot.get("slot_index") for slot in merged] != [
@@ -311,13 +356,20 @@ class Driver(BaseDriver):
 
                 return payload
 
-    async def _set_moonraker_active_spool(self, spool_id: int | None) -> None:
-        await self._request(
-            "POST",
-            "/server/filaman/spool_id",
-            {"spool_id": spool_id},
-        )
-        self._active_spool_id = spool_id
+    async def _set_moonraker_active_spool(
+        self,
+        spool_id: int | None,
+        extruder: str | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"spool_id": spool_id}
+        if extruder:
+            # Without this the component falls back to whichever extruder is
+            # currently active in Klipper, so the assignment lands on the wrong
+            # toolhead.
+            body["extruder"] = extruder
+        await self._request("POST", "/server/filaman/spool_id", body)
+        if extruder is None:
+            self._active_spool_id = spool_id
 
     def _render_gcode(
         self,
@@ -373,35 +425,29 @@ class Driver(BaseDriver):
         self,
         slot_index: str,
         filament_data: dict[str, Any],
+        spool_id: int | None = None,
     ) -> None:
         tray_type = str(filament_data.get("material_type") or "PLA")
         tray_color = str(filament_data.get("color") or "FFFFFF").replace("#", "")[:6]
         tray_info_idx = str(filament_data.get("tray_info_idx") or "FILAMAN")
 
-        changed = False
-        for slot in self._slots:
-            if slot.get("slot_index") != slot_index:
-                continue
-            slot.update(
-                {
-                    "tray_type": tray_type,
-                    "tray_color": tray_color,
-                    "tray_info_idx": tray_info_idx,
-                    "present": True,
-                }
-            )
-            changed = True
-            break
+        marked = {
+            "tray_type": tray_type,
+            "tray_color": tray_color,
+            "tray_info_idx": tray_info_idx,
+            "present": True,
+            "spool_id": spool_id,
+        }
 
-        if not changed:
+        slot = self._find_slot(slot_index)
+        if slot is not None:
+            slot.update(marked)
+        else:
             self._slots.append(
                 {
                     "slot_index": slot_index,
                     "slot_name": slot_index,
-                    "tray_info_idx": tray_info_idx,
-                    "tray_type": tray_type,
-                    "tray_color": tray_color,
-                    "present": True,
+                    **marked,
                 }
             )
 
@@ -442,11 +488,14 @@ class Driver(BaseDriver):
             )
 
         # Initial status check
+        initial_extruder_spools: dict[str, Any] = {}
         try:
             payload = await self._request("GET", "/server/filaman/status")
             result = self._unwrap_result(payload)
             self._connected = bool(result.get("filaman_connected", True))
             self._active_spool_id = result.get("spool_id")
+            if isinstance(result.get("extruder_spools"), dict):
+                initial_extruder_spools = result["extruder_spools"]
             self._last_error = None
             self._last_success_at = _now_iso()
         except Exception as exc:
@@ -454,6 +503,8 @@ class Driver(BaseDriver):
             self._last_error = str(exc)
 
         await self._refresh_slots(emit=False)
+        # After discovery, so the toolhead slots exist to be filled in.
+        self._apply_extruder_spools(initial_extruder_spools)
 
         self._emit_slots_update()
         self._poll_task = asyncio.create_task(self._poll_status_loop())
@@ -509,12 +560,18 @@ class Driver(BaseDriver):
         self._last_error = result.get("last_error")
         self._last_success_at = result.get("last_success_at") or _now_iso()
 
-        if previous_spool_id != self._active_spool_id:
+        extruder_spools = result.get("extruder_spools")
+        if not isinstance(extruder_spools, dict):
+            extruder_spools = {}
+        slots_changed = self._apply_extruder_spools(extruder_spools)
+
+        if slots_changed or previous_spool_id != self._active_spool_id:
             self._emit_slots_update()
 
         return {
             "connected": self._connected,
             "active_spool_id": self._active_spool_id,
+            "extruder_spools": extruder_spools,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
         }
@@ -536,15 +593,14 @@ class Driver(BaseDriver):
             raise ValueError("ams_id and tray_id must be integers")
 
         slot_index = f"{ams_id}-{tray_id}"
-        slot = next(
-            (item for item in self._slots if item.get("slot_index") == slot_index),
-            None,
-        )
+        slot = self._find_slot(slot_index)
         if slot is None:
             raise ValueError(f"Unknown slot index '{slot_index}'")
 
         async with self._lock:
-            await self._set_moonraker_active_spool(spool_id)
+            await self._set_moonraker_active_spool(
+                spool_id, extruder=self._slot_extruder(slot)
+            )
             await self._execute_assign_macro(
                 spool_id=spool_id,
                 ams_id=ams_id,
@@ -552,7 +608,7 @@ class Driver(BaseDriver):
                 slot_index=slot_index,
                 filament_data=filament_data,
             )
-            await self._mark_slot(slot_index, filament_data)
+            await self._mark_slot(slot_index, filament_data, spool_id=spool_id)
 
     async def assign_pending_spool(
         self,
