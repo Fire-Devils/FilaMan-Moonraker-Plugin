@@ -3,7 +3,7 @@
   "name": "Moonraker FilaMan",
   "driver_key": "moonraker_filaman",
   "plugin_type": "driver",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Driver that sends spool assignments from FilaMan to Moonraker's filaman component. Supports toolhead assignment and optional macro-based tray targets.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
