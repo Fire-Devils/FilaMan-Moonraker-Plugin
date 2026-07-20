@@ -686,19 +686,39 @@ class Driver(BaseDriver):
                 return slot_index
         return None
 
-    def _active_slot_index(self) -> str:
+    def _slot_spool_map(self) -> dict[str, int]:
+        """Current spool ownership per slot, as reported by the printer."""
+        out: dict[str, int] = {}
         for slot in self._slots:
-            if str(slot.get("slot_kind") or "").lower() == "toolhead":
-                return str(slot.get("slot_index") or "0-0")
+            spool_id = slot.get("spool_id")
+            if isinstance(spool_id, int) and not isinstance(spool_id, bool):
+                out[str(slot.get("slot_index"))] = spool_id
+        return out
 
-        for slot in self._slots:
-            if str(slot.get("slot_index") or "") == "0-0":
-                return "0-0"
+    async def _reconcile_slot_locations(self) -> None:
+        """Align spool locations with the per-slot spool map.
 
-        if self._slots:
-            return str(self._slots[0].get("slot_index") or "0-0")
+        Driven by the slots themselves rather than the printer-wide active
+        spool, which cannot express which toolhead a spool belongs to.
+        Caller must hold self._lock.
+        """
+        desired = self._slot_spool_map()
+        still_mounted = set(desired.values())
 
-        return "0-0"
+        for slot_index, spool_id in list(self._slot_to_filaman_spool.items()):
+            if desired.get(slot_index) == spool_id:
+                continue
+            self._slot_to_filaman_spool.pop(slot_index, None)
+            # Only send it home if it hasn't merely moved to another slot.
+            if spool_id not in still_mounted:
+                await self._restore_spool_location(spool_id)
+
+        for slot_index, spool_id in desired.items():
+            if self._slot_to_filaman_spool.get(slot_index) == spool_id:
+                continue
+            await self._cache_original_location(spool_id)
+            await self._move_spool_to_slot_location(spool_id, slot_index)
+            self._slot_to_filaman_spool[slot_index] = spool_id
 
     async def _move_spool_to_slot_location(self, spool_id: int, slot_index: str) -> None:
         slot_location_name = self._slot_location_name(slot_index)
@@ -851,14 +871,8 @@ class Driver(BaseDriver):
         # After discovery, so the toolhead slots exist to be filled in.
         self._apply_extruder_spools(initial_extruder_spools)
 
-        if self._active_spool_id is not None:
-            target_slot_index = self._active_slot_index()
-            await self._cache_original_location(self._active_spool_id)
-            await self._move_spool_to_slot_location(
-                self._active_spool_id,
-                target_slot_index,
-            )
-            self._slot_to_filaman_spool[target_slot_index] = self._active_spool_id
+        async with self._lock:
+            await self._reconcile_slot_locations()
 
         self._emit_slots_update()
         self._poll_task = asyncio.create_task(self._poll_status_loop())
@@ -919,34 +933,9 @@ class Driver(BaseDriver):
             extruder_spools = {}
         slots_changed = self._apply_extruder_spools(extruder_spools)
 
-        if previous_spool_id != self._active_spool_id:
+        if slots_changed:
             async with self._lock:
-                if previous_spool_id is not None:
-                    previous_slot_index = self._find_slot_for_spool(previous_spool_id)
-                    if previous_slot_index:
-                        self._slot_to_filaman_spool.pop(previous_slot_index, None)
-                    await self._restore_spool_location(previous_spool_id)
-
-                if self._active_spool_id is not None:
-                    target_slot_index = self._active_slot_index()
-                    old_slot_for_active = self._find_slot_for_spool(self._active_spool_id)
-                    if old_slot_for_active and old_slot_for_active != target_slot_index:
-                        self._slot_to_filaman_spool.pop(old_slot_for_active, None)
-
-                    replaced_spool_id = self._slot_to_filaman_spool.get(target_slot_index)
-                    if (
-                        replaced_spool_id is not None
-                        and replaced_spool_id != self._active_spool_id
-                    ):
-                        self._slot_to_filaman_spool.pop(target_slot_index, None)
-                        await self._restore_spool_location(replaced_spool_id)
-
-                    await self._cache_original_location(self._active_spool_id)
-                    await self._move_spool_to_slot_location(
-                        self._active_spool_id,
-                        target_slot_index,
-                    )
-                    self._slot_to_filaman_spool[target_slot_index] = self._active_spool_id
+                await self._reconcile_slot_locations()
 
         if slots_changed or previous_spool_id != self._active_spool_id:
             self._emit_slots_update()
