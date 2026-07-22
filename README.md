@@ -12,6 +12,10 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
 - Provide slot state in driver health for the existing spool assignment UI
 - Optional macro execution per slot (`tray_macros` mode)
 - Supports `assign_pending_spool()` for FilaMan auto-assign flows
+- Completes scale auto-assign when the printer's filament sensor detects
+  insertion (`auto_assign_confirm: sensor`, default) — AMS-flow parity for
+  Klipper. Alternatively `immediate` (assign right on the weigh event) or
+  `off` (ignore auto-assign events)
 
 ## Files
 
@@ -31,6 +35,7 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
   "moonraker_url": "http://192.168.1.20:7125",
   "api_key": "",
   "mode": "toolhead_only",
+  "auto_assign_confirm": "sensor",
   "request_timeout_seconds": 10,
   "slot_count": 1,
   "slot_targets": [
@@ -51,6 +56,24 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
   - Slots are discovered from Moonraker (toolheads and available trays).
 - `tray_macros`:
   - Assign action also runs `assign_gcode` for matching `slot_index`.
+
+## Auto-assign confirmation (`auto_assign_confirm`)
+
+When a FilaMan device (scale) with auto-assign enabled weighs a spool, the
+backend calls `assign_pending_spool()` on the driver. The pending spool is
+confirmed depending on `auto_assign_confirm`:
+
+- `sensor` (default): the assignment completes when the printer's filament
+  sensor reports a filament insertion (absent -> present transition), mirroring
+  the Bambu/AMS flow where physical insertion confirms the pending spool.
+  Requires the Moonraker `filaman` component with `track_filament_sensors`
+  enabled (default). Sensor state is polled with the regular status poll
+  (every 5 s). If no insertion happens before the device's auto-assign
+  timeout, the pending spool expires as before.
+- `immediate`: the spool is assigned to its slot (or the first toolhead slot)
+  right on the weigh event. Useful for setups without a filament sensor —
+  note that any weighing then re-assigns the active spool.
+- `off`: auto-assign events are ignored.
 
 ## Slot discovery
 

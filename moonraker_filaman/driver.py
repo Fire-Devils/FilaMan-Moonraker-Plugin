@@ -43,11 +43,16 @@ class Driver(BaseDriver):
         self._request_timeout = int(config.get("request_timeout_seconds", 10))
         self._slot_targets = self._normalize_slot_targets(config)
         self._slot_count = int(config.get("slot_count", 1))
+        confirm = str(config.get("auto_assign_confirm", "sensor")).strip().lower()
+        if confirm not in ("sensor", "immediate", "off"):
+            confirm = "sensor"
+        self._auto_assign_confirm = confirm
 
         self._slots: list[dict[str, Any]] = self._build_initial_slots()
         self._active_spool_id: int | None = None
         self._pending: dict[str, Any] | None = None
         self._pending_timer: asyncio.Task | None = None
+        self._filament_present: dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
         self._connected = False
@@ -940,6 +945,18 @@ class Driver(BaseDriver):
         if slots_changed or previous_spool_id != self._active_spool_id:
             self._emit_slots_update()
 
+        filament_present = result.get("filament_present")
+        if not isinstance(filament_present, dict):
+            filament_present = {}
+        previous_present = self._filament_present
+        self._filament_present = dict(filament_present)
+
+        if self._pending is not None and self._auto_assign_confirm == "sensor":
+            for extruder, present in filament_present.items():
+                if present and not previous_present.get(extruder):
+                    await self._complete_pending_assignment(extruder)
+                    break
+
         return {
             "connected": self._connected,
             "active_spool_id": self._active_spool_id,
@@ -1001,6 +1018,15 @@ class Driver(BaseDriver):
         slot_index: str | None = None,
         timeout_seconds: int | None = None,
     ) -> None:
+        if self._auto_assign_confirm == "off":
+            logger.info(
+                "Auto-assign disabled (auto_assign_confirm=off); ignoring spool %s "
+                "for printer %s",
+                spool_id,
+                self.printer_id,
+            )
+            return
+
         if self._pending_timer and not self._pending_timer.done():
             self._pending_timer.cancel()
 
@@ -1011,8 +1037,70 @@ class Driver(BaseDriver):
             "started_at": _now_iso(),
         }
 
+        if self._auto_assign_confirm == "immediate":
+            await self._complete_pending_assignment()
+            return
+
         timeout = timeout_seconds if timeout_seconds is not None else 60
         self._pending_timer = asyncio.create_task(self._pending_timeout_task(timeout))
+
+    def _clear_pending(self) -> None:
+        if self._pending_timer and not self._pending_timer.done():
+            self._pending_timer.cancel()
+        self._pending_timer = None
+        self._pending = None
+
+    async def _complete_pending_assignment(self, extruder: str | None = None) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+
+        spool_id = pending.get("spool_id")
+        if isinstance(spool_id, bool) or not isinstance(spool_id, int):
+            self._clear_pending()
+            return
+
+        slot: dict[str, Any] | None = None
+        slot_index = pending.get("slot_index")
+        if slot_index:
+            slot = self._find_slot(slot_index)
+        if slot is None and extruder is not None:
+            for candidate in self._slots:
+                if self._slot_extruder(candidate) == extruder:
+                    slot = candidate
+                    break
+        if slot is None and self._slots:
+            slot = self._slots[0]
+        if slot is None:
+            logger.info(
+                "Pending spool %s: no slot available to complete auto-assign "
+                "for printer %s",
+                spool_id,
+                self.printer_id,
+            )
+            self._clear_pending()
+            return
+
+        ams_id, tray_id = self._slot_to_ids(slot.get("slot_index", "0-0"))
+        filament_data = pending.get("filament_data") or {}
+        self._clear_pending()
+        try:
+            await self.send_filament_to_tray(
+                ams_id, tray_id, filament_data, spool_id=spool_id
+            )
+            logger.info(
+                "Auto-assign completed for spool %s on slot %s-%s (printer %s)",
+                spool_id,
+                ams_id,
+                tray_id,
+                self.printer_id,
+            )
+        except Exception:
+            logger.exception(
+                "Auto-assign completion failed for spool %s (printer %s)",
+                spool_id,
+                self.printer_id,
+            )
 
     async def _pending_timeout_task(self, timeout_seconds: int) -> None:
         await asyncio.sleep(timeout_seconds)

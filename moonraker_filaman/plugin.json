@@ -3,11 +3,13 @@
   "name": "Moonraker FilaMan",
   "driver_key": "moonraker_filaman",
   "plugin_type": "driver",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Driver that sends spool assignments from FilaMan to Moonraker's filaman component. Supports toolhead assignment and optional macro-based tray targets.",
   "author": "FilaMan",
   "homepage": "https://www.filaman.app",
-  "dependencies": ["aiohttp>=3.9.0,<4"],
+  "dependencies": [
+    "aiohttp>=3.9.0,<4"
+  ],
   "config_schema": {
     "type": "object",
     "properties": {
@@ -25,8 +27,22 @@
         "type": "string",
         "title": "Assignment Mode",
         "description": "toolhead_only sets the active spool in Moonraker. tray_macros additionally runs tray macros per slot.",
-        "enum": ["toolhead_only", "tray_macros"],
+        "enum": [
+          "toolhead_only",
+          "tray_macros"
+        ],
         "default": "toolhead_only"
+      },
+      "auto_assign_confirm": {
+        "type": "string",
+        "title": "Auto-Assign Confirmation",
+        "description": "How a pending spool from a scale auto-assign event is confirmed: 'sensor' completes the assignment when the printer's filament sensor detects insertion, 'immediate' assigns right away on the weigh event, 'off' ignores auto-assign events.",
+        "enum": [
+          "sensor",
+          "immediate",
+          "off"
+        ],
+        "default": "sensor"
       },
       "request_timeout_seconds": {
         "type": "integer",
@@ -68,7 +84,10 @@
               "default": "FFFFFF"
             }
           },
-          "required": ["slot_index", "slot_name"]
+          "required": [
+            "slot_index",
+            "slot_name"
+          ]
         },
         "default": []
       },
@@ -81,7 +100,9 @@
         "maximum": 32
       }
     },
-    "required": ["moonraker_url"]
+    "required": [
+      "moonraker_url"
+    ]
   },
   "capabilities": {
     "has_slots": true,
