@@ -47,6 +47,7 @@ class Driver(BaseDriver):
         if confirm not in ("sensor", "immediate", "off"):
             confirm = "sensor"
         self._auto_assign_confirm = confirm
+        self._sensor_timeout = int(config.get("sensor_timeout_seconds", 300))
 
         self._slots: list[dict[str, Any]] = self._build_initial_slots()
         self._active_spool_id: int | None = None
@@ -1030,18 +1031,53 @@ class Driver(BaseDriver):
         if self._pending_timer and not self._pending_timer.done():
             self._pending_timer.cancel()
 
+        target_slot: dict[str, Any] | None = None
+        if slot_index:
+            target_slot = self._find_slot(slot_index)
+        if target_slot is None and self._slots:
+            target_slot = self._slots[0]
+        target_extruder = self._slot_extruder(target_slot) if target_slot else None
+        filament_was_present = (
+            bool(self._filament_present.get(target_extruder))
+            if target_extruder is not None
+            else False
+        )
+
         self._pending = {
             "spool_id": spool_id,
             "filament_data": dict(filament_data or {}),
             "slot_index": slot_index,
             "started_at": _now_iso(),
+            "filament_was_present": filament_was_present,
         }
 
         if self._auto_assign_confirm == "immediate":
             await self._complete_pending_assignment()
             return
 
-        timeout = timeout_seconds if timeout_seconds is not None else 60
+        # In sensor mode a real spool change (heat up, unload, insert) easily
+        # exceeds the device-level auto-assign timeout, so the driver uses its
+        # own window while waiting for the filament sensor.
+        timeout = self._sensor_timeout
+        if filament_was_present:
+            logger.info(
+                "Pending spool %s armed for printer %s while filament is already "
+                "present on '%s' — likely a control weighing; assignment completes "
+                "only after unload + reinsert within %s s",
+                spool_id,
+                self.printer_id,
+                target_extruder,
+                timeout,
+            )
+        else:
+            logger.info(
+                "Pending spool %s armed for printer %s — waiting for filament "
+                "insertion on '%s' (timeout %s s)",
+                spool_id,
+                self.printer_id,
+                target_extruder or "toolhead",
+                timeout,
+            )
         self._pending_timer = asyncio.create_task(self._pending_timeout_task(timeout))
 
     def _clear_pending(self) -> None:
@@ -1105,11 +1141,19 @@ class Driver(BaseDriver):
     async def _pending_timeout_task(self, timeout_seconds: int) -> None:
         await asyncio.sleep(timeout_seconds)
         if self._pending is not None:
-            logger.info(
-                "Pending spool %s timed out for printer %s",
-                self._pending.get("spool_id"),
-                self.printer_id,
-            )
+            if self._pending.get("filament_was_present"):
+                logger.info(
+                    "Pending spool %s expired for printer %s without an unload — "
+                    "treated as a control weighing, active spool unchanged",
+                    self._pending.get("spool_id"),
+                    self.printer_id,
+                )
+            else:
+                logger.info(
+                    "Pending spool %s timed out for printer %s",
+                    self._pending.get("spool_id"),
+                    self.printer_id,
+                )
             self._pending = None
 
     def health(self) -> dict[str, Any]:
@@ -1123,6 +1167,17 @@ class Driver(BaseDriver):
             "active_spool_id": self._active_spool_id,
             "pending": self._pending is not None,
             "pending_spool_id": self._pending.get("spool_id") if self._pending else None,
+            "pending_started_at": (
+                self._pending.get("started_at") if self._pending else None
+            ),
+            "pending_requires_unload": (
+                bool(self._pending.get("filament_was_present"))
+                if self._pending
+                else None
+            ),
+            "auto_assign_confirm": self._auto_assign_confirm,
+            "sensor_timeout_seconds": self._sensor_timeout,
+            "filament_present": self._filament_present,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "slot_count": len(self._slots),

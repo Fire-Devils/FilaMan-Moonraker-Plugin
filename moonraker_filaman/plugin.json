@@ -36,13 +36,21 @@
       "auto_assign_confirm": {
         "type": "string",
         "title": "Auto-Assign Confirmation",
-        "description": "How a pending spool from a scale auto-assign event is confirmed: 'sensor' completes the assignment when the printer's filament sensor detects insertion, 'immediate' assigns right away on the weigh event, 'off' ignores auto-assign events.",
+        "description": "How a pending spool from a scale auto-assign event is confirmed: 'sensor' completes the assignment when the printer's filament sensor detects an insertion (if filament is already present at weigh time, the assignment requires an unload + reinsert — a weigh-only event is treated as a control weighing and expires), 'immediate' assigns right away on the weigh event, 'off' ignores auto-assign events.",
         "enum": [
           "sensor",
           "immediate",
           "off"
         ],
         "default": "sensor"
+      },
+      "sensor_timeout_seconds": {
+        "type": "integer",
+        "title": "Sensor Confirmation Timeout (seconds)",
+        "description": "How long a pending spool waits for the filament sensor confirmation in 'sensor' mode. A real spool change (heat up, unload, insert) usually needs a few minutes.",
+        "default": 300,
+        "minimum": 10,
+        "maximum": 3600
       },
       "request_timeout_seconds": {
         "type": "integer",

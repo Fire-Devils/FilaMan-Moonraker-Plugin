@@ -36,6 +36,7 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
   "api_key": "",
   "mode": "toolhead_only",
   "auto_assign_confirm": "sensor",
+  "sensor_timeout_seconds": 300,
   "request_timeout_seconds": 10,
   "slot_count": 1,
   "slot_targets": [
@@ -68,8 +69,13 @@ confirmed depending on `auto_assign_confirm`:
   the Bambu/AMS flow where physical insertion confirms the pending spool.
   Requires the Moonraker `filaman` component with `track_filament_sensors`
   enabled (default). Sensor state is polled with the regular status poll
-  (every 5 s). If no insertion happens before the device's auto-assign
-  timeout, the pending spool expires as before.
+  (every 5 s). The pending spool waits `sensor_timeout_seconds` (default
+  300 s — a real spool change with heat up + unload + insert needs a few
+  minutes). Control weighings are recognized: if filament is already present
+  at weigh time, the assignment only completes after an unload + reinsert;
+  a weigh-only event simply expires and the active spool stays unchanged
+  (`pending_requires_unload` in driver health shows this state). Both change
+  orders work: weigh -> unload -> insert, and unload -> weigh -> insert.
 - `immediate`: the spool is assigned to its slot (or the first toolhead slot)
   right on the weigh event. Useful for setups without a filament sensor —
   note that any weighing then re-assigns the active spool.
