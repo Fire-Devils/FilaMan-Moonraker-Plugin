@@ -43,19 +43,39 @@ def _name_matches(name: str, needle: str, prefix: bool) -> bool:
     return lowered.startswith(target) if prefix else lowered == target
 
 
+# Polls a slot must keep reading empty, unchanged, before its spool is released.
+# The reading is one 5 s sample of a mechanical switch, and the release is
+# destructive and not undone by re-inserting the spool, so a single sample is
+# not enough evidence. Three costs ~10 s of lag on a real removal.
+RELEASE_CONFIRM_POLLS = 3
+
 # Per-slot presence as reported by the AMS/MMU firmwares this plugin targets.
-# keys: match    exact object name, or a name prefix when per_slot is set
-#       path     dotted path to the presence data inside the object
-#       per_slot one object per slot (True) or one object mapping all of them
+# keys: match        exact object name, or a name prefix when per_slot is set
+#       path         dotted path to the presence data inside the object
+#       per_slot     one object per slot (True) or one object mapping all of them
+#       release_when dotted path -> value the object must report before an empty
+#                    slot is believed to mean the spool was taken out. Optional:
+#                    without it only the print state gates a release.
 # Values are read with _slot_sensor_present_value(): numbers > 0 mean present,
 # booleans are taken as-is. That is deliberate — Happy Hare uses -1 for
 # "unknown", which truthiness would report as occupied.
 SLOT_SENSOR_PRESETS: list[dict[str, Any]] = [
     # QIDI BOX: {"slot0": 2, "slot1": 1, ...}; 0 empty, 1 present, 2 loaded.
+    # What the state actually reports is FILAMENT IN THE HUB PATH, not a spool
+    # on the holder — the source is the per-slot runout switch. So a 0 also
+    # appears while the box retracts a slot on command, during a runout with the
+    # spool still mounted, and during a tool change. Each of those is excluded
+    # by a field the same object already publishes.
     {
         "match": "multi_color_controller",
         "per_slot": False,
         "path": "slots.states",
+        "release_when": {
+            "hardware.connected": True,
+            "system.ready": True,
+            "operation.current": -1,
+            "print.printing": False,
+        },
     },
     # Happy Hare: gate_status is a LIST indexed by gate.
     # -1 unknown, 0 empty, 1 available, 2 available from buffer.
@@ -161,6 +181,13 @@ class Driver(BaseDriver):
         self._pending_timer: asyncio.Task | None = None
         self._filament_present: dict[str, Any] = {}
         self._slot_sensor_present: dict[str, bool] = {}
+        # slot number -> {"spool_id", "polls"}: removals seen but not yet acted
+        # on, either still being confirmed or waiting for the printer to be in a
+        # state where an empty slot means what it says.
+        self._pending_release: dict[str, dict[str, Any]] = {}
+        self._slot_sensor_release_when: dict[str, Any] = {}
+        self._slot_sensor_health_obj: dict[str, Any] | None = None
+        self._printer_state: str | None = None
         # True when slot_sensor_object lists one object PER SLOT
         # (AFC), False when a single object holds a map of all of them
         # (QIDI, Happy Hare). Autodetection sets it; configuring the
@@ -311,6 +338,21 @@ class Driver(BaseDriver):
             return value > 0
         return None
 
+    @staticmethod
+    def _slot_sensor_value_unknown(value: Any) -> bool:
+        """A negative state asserts nothing (Happy Hare GATE_UNKNOWN = -1).
+
+        _slot_sensor_present_value() maps it to False, which is the right answer
+        to "is it occupied" and the wrong one to "did the spool leave": a gate
+        that has never been read would unbind whatever is assigned to it. Such a
+        value is dropped entirely, so it neither seeds a baseline nor moves one.
+        """
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value < 0
+        )
+
     def _warn_once(self, key: str, message: str, *args: Any) -> None:
         """Log a warning the first time a condition appears, then stay quiet.
 
@@ -343,6 +385,68 @@ class Driver(BaseDriver):
                 return idx
         return None
 
+    @staticmethod
+    def _sensor_edges(
+        previous: dict[str, bool], current: dict[str, bool]
+    ) -> tuple[list[str], list[str]]:
+        """(appeared, vacated), counting only transitions with a baseline.
+
+        `previous.get(key) is False` rather than `not previous.get(key)`: a slot
+        we have never read before is unknown, not empty, and treating it as
+        empty turns pre-existing occupancy on the first poll into an insertion.
+        The vacated side is symmetric for the same reason.
+        """
+        appeared = [
+            key for key, present in current.items() if present and previous.get(key) is False
+        ]
+        vacated = [
+            key
+            for key, present in current.items()
+            if not present and previous.get(key) is True
+        ]
+        return appeared, vacated
+
+    def _sensor_baseline_from_slots(self) -> dict[str, bool]:
+        """Sensor baseline built from the assignments, not from the hardware.
+
+        Used once at start-up, right after assignments are restored from spool
+        locations, so a spool pulled out while the driver was down reads as an
+        ordinary present->empty edge on the first poll. Seeding from the
+        hardware instead records that slot as "always been empty", the edge
+        never happens, and the stale binding survives every restart — which is
+        exactly how it behaved before.
+        """
+        by_key: dict[str, list[str]] = {}
+        for slot in self._slots:
+            if str(slot.get("slot_kind") or "") != "tray":
+                continue
+            if slot.get("spool_id") is None:
+                continue
+            slot_index = str(slot.get("slot_index") or "")
+            match = re.fullmatch(r"(\d+)-(\d+)", slot_index)
+            if not match:
+                # _slot_to_ids() answers (0, 0) for anything it cannot parse, so
+                # a hand-written slot_index like "toolhead" would seed the
+                # baseline of slot number 0 — a different, real slot.
+                continue
+            by_key.setdefault(match.group(2), []).append(slot_index)
+
+        # Cascaded units collapse onto one sensor key ("1-0" and "2-0" are both
+        # slot 0) and _sensor_key_to_slot_index() answers with the first match,
+        # so a removal on one unit could release the other's slot. Seed neither.
+        for key, owners in by_key.items():
+            if len(owners) > 1:
+                self._warn_once(
+                    f"slot_sensor_key_collision:{key}",
+                    "Slot number %s on printer %s is claimed by %s; not tracking "
+                    "removals for it, because the sensor cannot say which unit "
+                    "it means",
+                    key,
+                    self.printer_id,
+                    owners,
+                )
+        return {key: True for key, owners in by_key.items() if len(owners) == 1}
+
     async def _autodetect_slot_sensor(self) -> None:
         """Pick a slot-presence source from the objects the printer exposes.
 
@@ -374,6 +478,7 @@ class Driver(BaseDriver):
                 continue
             self._slot_sensor_objects = found
             self._slot_sensor_per_slot = per_slot
+            self._slot_sensor_release_when = dict(preset.get("release_when") or {})
             # Re-adopt the path too, unless the user pinned one by hand.
             if self._slot_sensor_path_autodetected or not self._slot_sensor_states_path:
                 self._slot_sensor_states_path = str(preset["path"])
@@ -420,7 +525,14 @@ class Driver(BaseDriver):
             )
             return {}
 
-        query = "&".join(quote(name, safe="") for name in self._slot_sensor_objects)
+        # print_stats rides along in the same request: a removal must not be
+        # believed mid-print, where an empty slot is a tool change or a runout
+        # far more often than a spool leaving. An object the printer does not
+        # have comes back empty rather than failing the query.
+        query = "&".join(
+            quote(name, safe="")
+            for name in [*self._slot_sensor_objects, "print_stats"]
+        )
         try:
             payload = await self._request("GET", f"/printer/objects/query?{query}")
         except Exception as exc:
@@ -437,20 +549,28 @@ class Driver(BaseDriver):
             )
             return {}
 
+        state = self._dig(status.get("print_stats") or {}, "state")
+        self._printer_state = str(state) if isinstance(state, str) else None
+
         out: dict[str, bool] = {}
         labels: dict[str, str] = {}
         seen_object = False
+        health_obj: dict[str, Any] | None = None
         for position, name in enumerate(self._slot_sensor_objects):
             obj = status.get(name)
             if not isinstance(obj, dict):
                 continue
             seen_object = True
+            if not self._slot_sensor_per_slot:
+                # The single object holding every slot is also the one carrying
+                # the health and busy fields a release is gated on.
+                health_obj = obj
             raw = self._dig(obj, self._slot_sensor_states_path)
 
             if self._slot_sensor_per_slot:
                 # One object per slot: raw is that slot's own presence value.
                 present = self._slot_sensor_present_value(raw)
-                if present is not None:
+                if present is not None and not self._slot_sensor_value_unknown(raw):
                     key = str(position)
                     out[key] = present
                     labels[key] = name
@@ -459,7 +579,7 @@ class Driver(BaseDriver):
             if isinstance(raw, dict):
                 for raw_key, value in raw.items():
                     present = self._slot_sensor_present_value(value)
-                    if present is None:
+                    if present is None or self._slot_sensor_value_unknown(value):
                         continue
                     match = re.search(r"(\d+)\s*$", str(raw_key))
                     if not match:
@@ -470,10 +590,12 @@ class Driver(BaseDriver):
             elif isinstance(raw, (list, tuple)):
                 for index, value in enumerate(raw):
                     present = self._slot_sensor_present_value(value)
-                    if present is not None:
-                        key = str(index)
-                        out[key] = present
-                        labels[key] = f"{self._slot_sensor_states_path}[{index}]"
+                    if present is None or self._slot_sensor_value_unknown(value):
+                        continue
+                    key = str(index)
+                    out[key] = present
+                    labels[key] = f"{self._slot_sensor_states_path}[{index}]"
+        self._slot_sensor_health_obj = health_obj
 
         if not out:
             # A successful query that yields nothing means the object or the path
@@ -495,11 +617,13 @@ class Driver(BaseDriver):
         return out
 
     async def _poll_slot_sensor(self) -> None:
-        """Confirm a pending assignment when a slot goes empty -> present.
+        """Track both slot edges: confirm an insertion, release a removal.
 
         Complements the toolhead filament sensor: inserting a spool into an AMS
         slot never reaches the nozzle sensor, but the AMS's own per-slot presence
-        does change, and the slot that lights up identifies itself.
+        does change, and the slot that lights up identifies itself. The removal
+        edge has no other observer at all — a slot's `present` is derived from
+        its assignment, never from the hardware.
         """
         current = await self._read_slot_sensor()
         if not current:
@@ -508,16 +632,29 @@ class Driver(BaseDriver):
         previous = self._slot_sensor_present
         self._slot_sensor_present = current
 
+        edges, vacated = self._sensor_edges(previous, current)
+
+        # A slot that reads occupied again settles the question by itself.
+        for key in [k for k, present in current.items() if present]:
+            self._pending_release.pop(key, None)
+
+        # An edge is a moment, the disagreement it reports lasts. Removals still
+        # being confirmed, or held because the printer was busy, are re-offered
+        # every poll — otherwise one refusal buried the removal for good.
+        candidates = list(
+            dict.fromkeys(
+                vacated
+                + [key for key in self._pending_release if current.get(key) is False]
+            )
+        )
+        # Before the pending gate: a spool being taken out is not an answer to a
+        # pending assignment, and happens whatever auto_assign_confirm is set to.
+        if candidates:
+            await self._handle_vacated_slots(candidates)
+
         if self._pending is None or self._auto_assign_confirm != "sensor":
             return
 
-        # Fire only on a real empty->present edge we have a baseline for, so
-        # pre-existing occupancy on the first poll never counts as insertion.
-        edges = [
-            key
-            for key, present in current.items()
-            if present and previous.get(key) is False
-        ]
         if not edges:
             return
         if len(edges) > 1:
@@ -555,6 +692,118 @@ class Driver(BaseDriver):
             self.printer_id,
         )
         await self._complete_pending_assignment(slot_index=slot_index)
+
+    def _release_blockers(self) -> list[str]:
+        """Reasons an empty slot must not be read as "the spool was taken out".
+
+        The sensor reports filament in the slot's path, not a spool on the
+        holder, so it also reads empty while the box works the filament itself.
+        Each blocker is a field the printer already publishes; a field this
+        firmware does not have says nothing and does not block.
+        """
+        blockers: list[str] = []
+        if self._printer_state in ("printing", "paused"):
+            # A tool change and a runout both empty a slot mid-print, and a
+            # runout leaves the spool physically in place.
+            blockers.append(f"print_stats.state={self._printer_state}")
+
+        obj = self._slot_sensor_health_obj or {}
+        for path, expected in (self._slot_sensor_release_when or {}).items():
+            actual = self._dig(obj, path)
+            if actual is None:
+                continue
+            if actual != expected:
+                blockers.append(f"{path}={actual!r} (want {expected!r})")
+        return blockers
+
+    async def _handle_vacated_slots(self, keys: list[str]) -> None:
+        """Confirm, hold or act on slots the sensor reports empty.
+
+        Nothing else in this driver notices a removal — a slot's `present` is
+        derived from its assignment, never from the hardware — so without this a
+        spool taken out by hand stays bound forever and, because the binding is
+        persisted as the spool's location, comes back on every restart.
+
+        Releasing is destructive and re-inserting the spool does NOT undo it
+        (the insertion edge only completes a pending assignment), so a single
+        reading is not enough: the slot must read empty RELEASE_CONFIRM_POLLS
+        times running, with the same spool bound, while nothing else explains
+        the emptiness.
+        """
+        blockers = self._release_blockers()
+        for key in keys:
+            slot_index = self._sensor_key_to_slot_index(key)
+            slot = self._find_slot(slot_index) if slot_index else None
+            spool_id = slot.get("spool_id") if slot else None
+            if slot is None or spool_id is None:
+                # Either padding beyond the physical trays (QIDI reports 16 slots
+                # for one box) or a slot holding nothing. Neither is a removal.
+                if slot is not None and slot.get("present"):
+                    slot["present"] = False
+                self._pending_release.pop(key, None)
+                continue
+
+            pending = self._pending_release.get(key)
+            if pending is None or pending.get("spool_id") != spool_id:
+                # A different spool than the one being counted for: the slot was
+                # reassigned while we watched, so the evidence starts over.
+                pending = {"spool_id": spool_id, "polls": 0}
+                self._pending_release[key] = pending
+
+            if blockers:
+                # Kept, not dropped: the entry is what re-offers this removal on
+                # later polls, so it resolves by itself once the printer is idle.
+                pending["polls"] = 0
+                continue
+
+            pending["polls"] += 1
+            if pending["polls"] < RELEASE_CONFIRM_POLLS:
+                continue
+            self._pending_release.pop(key, None)
+            await self._release_slot(key, slot_index, spool_id)
+
+        if blockers and self._pending_release:
+            self._warn_once(
+                "slot_release_blocked",
+                "Slots %s on printer %s read empty, but %s — not releasing their "
+                "spools until that clears.",
+                [self._slot_sensor_labels.get(key, key) for key in self._pending_release],
+                self.printer_id,
+                "; ".join(blockers),
+            )
+        elif not blockers:
+            self._clear_warn_once("slot_release_blocked")
+
+    async def _release_slot(self, key: str, slot_index: str, spool_id: int) -> None:
+        async with self._lock:
+            slot = self._find_slot(slot_index)
+            if slot is None or slot.get("spool_id") != spool_id:
+                # Reassigned while the readings were being collected — most
+                # likely by send_filament_to_tray(), which holds the lock across
+                # a macro that can take a minute. Its binding is newer than this
+                # evidence, so it stands.
+                return
+            slot["spool_id"] = None
+            slot["present"] = False
+            # "" and not None: _refresh_slots() carries a previous value over
+            # only when it is not None/""/False, so this lets rediscovery win
+            # instead of resurrecting the filament that just left.
+            for field in ("tray_type", "tray_color", "tray_info_idx"):
+                slot[field] = ""
+            # Moonraker's active spool is deliberately left alone: the spool
+            # pulled out of a tray is not necessarily the one in the nozzle,
+            # and clearing it would drop the tracking of whatever is.
+            await self._reconcile_slot_locations(vacated_slot_index=slot_index)
+        logger.info(
+            "Slot %s stayed empty for %d polls -> released spool %s from %s "
+            "(printer %s)",
+            self._slot_sensor_labels.get(key, key),
+            RELEASE_CONFIRM_POLLS,
+            spool_id,
+            slot_index,
+            self.printer_id,
+        )
+        self._emit_slots_update()
 
     def _apply_extruder_spools(self, extruder_spools: dict[str, Any]) -> bool:
         """Mirror Moonraker's per-extruder spool map onto the toolhead slots."""
@@ -1110,12 +1359,18 @@ class Driver(BaseDriver):
                 out[str(slot.get("slot_index"))] = spool_id
         return out
 
-    async def _reconcile_slot_locations(self) -> None:
+    async def _reconcile_slot_locations(
+        self, vacated_slot_index: str | None = None
+    ) -> None:
         """Align spool locations with the per-slot spool map.
 
         Driven by the slots themselves rather than the printer-wide active
         spool, which cannot express which toolhead a spool belongs to.
         Caller must hold self._lock.
+
+        vacated_slot_index names a slot whose spool was just observed to be
+        gone, which lets the restore below clear a location that would otherwise
+        stay pointing at it.
         """
         desired = self._slot_spool_map()
         still_mounted = set(desired.values())
@@ -1126,7 +1381,12 @@ class Driver(BaseDriver):
             self._slot_to_filaman_spool.pop(slot_index, None)
             # Only send it home if it hasn't merely moved to another slot.
             if spool_id not in still_mounted:
-                await self._restore_spool_location(spool_id)
+                await self._restore_spool_location(
+                    spool_id,
+                    vacated_slot_index=(
+                        slot_index if slot_index == vacated_slot_index else None
+                    ),
+                )
 
         for slot_index, spool_id in desired.items():
             if self._slot_to_filaman_spool.get(slot_index) == spool_id:
@@ -1317,11 +1577,55 @@ class Driver(BaseDriver):
                         exc_info=True,
                     )
 
-    async def _restore_spool_location(self, spool_id: int) -> None:
-        if spool_id not in self._spool_original_known:
+    async def _clear_slot_location(self, spool_id: int, slot_index: str) -> None:
+        """Detach a spool from a slot location without knowing where it belongs.
+
+        Only ever clears a location that IS this slot's; anything else belongs
+        to the host application and overwriting it would be guesswork.
+        """
+        identifier = self._slot_location_identifier(slot_index)
+        try:
+            async with async_session_maker() as db:
+                spool = await db.get(Spool, spool_id)
+                if spool is None or spool.location_id is None:
+                    return
+                location = await db.get(Location, spool.location_id)
+                if location is None or location.identifier != identifier:
+                    return
+                await SpoolService(db).move_location(
+                    spool,
+                    None,
+                    datetime.now(timezone.utc),
+                    source="driver",
+                    note="Removed from Moonraker slot",
+                )
+            logger.info(
+                "Spool %s has no recorded origin; cleared its %s location so the "
+                "slot cannot re-claim it on restart (printer %s)",
+                spool_id,
+                slot_index,
+                self.printer_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to clear the slot location of spool %s: %s", spool_id, exc
+            )
+
+    async def _restore_spool_location(
+        self, spool_id: int, vacated_slot_index: str | None = None
+    ) -> None:
+        if spool_id in self._slot_to_filaman_spool.values():
             return
 
-        if spool_id in self._slot_to_filaman_spool.values():
+        if spool_id not in self._spool_original_known:
+            if vacated_slot_index is None:
+                return
+            # Where it came from was never recorded (the assignment predates the
+            # cache, or its row was lost), and the spool has just been observed
+            # to be gone from this slot. Leaving the location pointing there is
+            # not neutral: _restore_slots_from_locations() reads exactly that row
+            # on the next start and binds the spool straight back in.
+            await self._clear_slot_location(spool_id, vacated_slot_index)
             return
 
         original_location_id = self._spool_original_location.get(spool_id)
@@ -1399,6 +1703,11 @@ class Driver(BaseDriver):
         # rather than pre-existing occupancy.
         with contextlib.suppress(Exception):
             await self._autodetect_slot_sensor()
+        # Seeded from the assignments just restored, so a spool removed while
+        # the driver was down is a present->empty edge on the first poll rather
+        # than an invisible disagreement with the printer. Slots we hold no
+        # assignment for stay absent from the baseline and produce no edge.
+        self._slot_sensor_present = self._sensor_baseline_from_slots()
         with contextlib.suppress(Exception):
             await self._poll_slot_sensor()
 
@@ -1785,6 +2094,10 @@ class Driver(BaseDriver):
             "slot_sensor_states_path": self._slot_sensor_states_path,
             "slot_sensor_autodetected": self._slot_sensor_autodetected,
             "slot_sensor_present": self._slot_sensor_present,
+            # Why a slot that reads empty still shows a spool: either it is
+            # still being confirmed, or something explains the emptiness.
+            "pending_release": self._pending_release,
+            "release_blockers": self._release_blockers(),
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "slot_count": len(self._slots),
