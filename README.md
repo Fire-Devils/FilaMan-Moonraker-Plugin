@@ -88,8 +88,12 @@ object by hand you must set the path too, since detection fills in the pair or n
 | System | Object | Path | Values |
 |---|---|---|---|
 | QIDI BOX | `multi_color_controller` | `slots.states` | dict; `0` empty, `1` present, `2` loaded |
-| Happy Hare | `mmu` | `gate_status` | list; `-1` unknown, `0` empty, `1`/`2` available |
+| Happy Hare | `mmu` | `gate_status` | list; `-1` unknown, `0` empty, `1`/`2` available <sup>†</sup> |
 | AFC | `AFC_stepper <lane>`, one object per lane | `prep` | boolean |
+
+<sup>†</sup> Happy Hare only tracks physical insertion when pre-gate/gate sensors are fitted. Without
+them `gate_status` is updated by command (`MMU_CHECK_GATE`, gate map edits) rather than by putting
+a spool in, so confirmation-by-insertion will not fire — use `immediate`, or assign by hand.
 
 - `slot_sensor_object` — a single object, or a list of objects when there is one per slot. Names
   are matched case-insensitively against the printer's object list; as an override, give the full

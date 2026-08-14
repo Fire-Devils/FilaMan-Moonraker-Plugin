@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 AFC_LANE_PREFIX = "afc_stepper "
 MMU_GATE_PREFIX = "mmu_gate "
 
+# Defaults live here so the code and plugin.json's schema cannot drift apart,
+# and so the fallback for an unrecognised auto_assign_confirm follows the default
+# instead of pinning "sensor" forever if the default is ever changed.
+AUTO_ASSIGN_CONFIRM_VALUES = ("sensor", "immediate", "off")
+DEFAULT_AUTO_ASSIGN_CONFIRM = "sensor"
+DEFAULT_SENSOR_TIMEOUT_SECONDS = 300
+MIN_SENSOR_TIMEOUT_SECONDS = 10
+MAX_SENSOR_TIMEOUT_SECONDS = 3600
+
 
 def _name_matches(name: str, needle: str, prefix: bool) -> bool:
     """Case-insensitive object-name match; prefix for per-lane objects."""
@@ -90,11 +99,31 @@ class Driver(BaseDriver):
         self._request_timeout = int(config.get("request_timeout_seconds", 10))
         self._slot_targets = self._normalize_slot_targets(config)
         self._slot_count = int(config.get("slot_count", 1))
-        confirm = str(config.get("auto_assign_confirm", "sensor")).strip().lower()
-        if confirm not in ("sensor", "immediate", "off"):
-            confirm = "sensor"
+        confirm = str(
+            config.get("auto_assign_confirm", DEFAULT_AUTO_ASSIGN_CONFIRM)
+        ).strip().lower()
+        if confirm not in AUTO_ASSIGN_CONFIRM_VALUES:
+            logger.warning(
+                "Unknown auto_assign_confirm %r for printer %s; using %r",
+                confirm,
+                printer_id,
+                DEFAULT_AUTO_ASSIGN_CONFIRM,
+            )
+            confirm = DEFAULT_AUTO_ASSIGN_CONFIRM
         self._auto_assign_confirm = confirm
-        self._sensor_timeout = int(config.get("sensor_timeout_seconds", 300))
+        # Clamped here as well as in the schema: the schema's bounds only apply
+        # to configs written through the UI.
+        self._sensor_timeout = max(
+            MIN_SENSOR_TIMEOUT_SECONDS,
+            min(
+                MAX_SENSOR_TIMEOUT_SECONDS,
+                int(
+                    config.get(
+                        "sensor_timeout_seconds", DEFAULT_SENSOR_TIMEOUT_SECONDS
+                    )
+                ),
+            ),
+        )
         # Slot sensor confirmation: watch per-slot filament presence reported by
         # the AMS/MMU itself, so inserting a spool into a SLOT — not only loading
         # it to the nozzle — confirms a pending auto-assign, and the slot that
@@ -1362,7 +1391,8 @@ class Driver(BaseDriver):
 
         # Slot marks are in-memory only; a restart would otherwise publish four
         # empty slots and overwrite the persisted assignments.
-        await self._restore_slots_from_locations()
+        async with self._lock:
+            await self._restore_slots_from_locations()
 
         # Pick a slot-presence source unless one is configured, then seed the
         # baseline so the first real insertion reads as an empty->present edge
@@ -1458,10 +1488,16 @@ class Driver(BaseDriver):
                     await self._complete_pending_assignment(extruder)
                     break
 
-        # Both consumers of this return value feed active_spool_id into
-        # _handle_slots_update() with an EMPTY slot list, which stamps it onto
-        # slot 0-0. Harmless for a toolhead-only printer, wrong for a tray box:
-        # it overwrites the real per-slot map on every health refresh.
+        # A printer-wide active spool cannot name a tray, so on a tray printer it
+        # is not reported from here. health() and the slots_update event still
+        # carry it; this return value is consumed only for slot bookkeeping.
+        #
+        # (Why it matters, verified against filaman-system 1.2.38: both callers
+        # of this return value pass active_spool_id into _handle_slots_update()
+        # with an empty slot list, which falls back to writing it into slot 0-0 —
+        # and the web UI polls one of them every few seconds, so it overwrote the
+        # real per-slot map continuously. That is host-application code, not in
+        # this repo, so treat the parenthetical as dated rather than current.)
         has_tray_slots = any(
             str(slot.get("slot_kind") or "") == "tray" for slot in self._slots
         )
