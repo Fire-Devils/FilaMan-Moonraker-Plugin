@@ -19,6 +19,34 @@ from app.services.spool_service import SpoolService
 
 logger = logging.getLogger(__name__)
 
+# Per-slot presence as reported by the AMS/MMU firmwares this plugin targets.
+# (object glob, path within the object, one object per slot?)
+# Values are read with _slot_sensor_present_value(): numbers > 0 mean present,
+# booleans are taken as-is. That is deliberate — Happy Hare uses -1 for
+# "unknown", which truthiness would report as occupied.
+SLOT_SENSOR_PRESETS: list[dict[str, Any]] = [
+    # QIDI BOX: {"slot0": 2, "slot1": 1, ...}; 0 empty, 1 present, 2 loaded.
+    {
+        "match": "multi_color_controller",
+        "per_slot": False,
+        "path": "slots.states",
+    },
+    # Happy Hare: gate_status is a LIST indexed by gate.
+    # -1 unknown, 0 empty, 1 available, 2 available from buffer.
+    {
+        "match": "mmu",
+        "per_slot": False,
+        "path": "gate_status",
+    },
+    # AFC: one object per lane, each with a boolean `prep`.
+    {
+        "match": "AFC_stepper ",
+        "per_slot": True,
+        "path": "prep",
+    },
+]
+
+
 _ORIGINAL_LOCATION_PARAM_KEY = "moonraker_original_location_id"
 _NONE_LOCATION_SENTINEL = "__none__"
 
@@ -43,11 +71,46 @@ class Driver(BaseDriver):
         self._request_timeout = int(config.get("request_timeout_seconds", 10))
         self._slot_targets = self._normalize_slot_targets(config)
         self._slot_count = int(config.get("slot_count", 1))
+        confirm = str(config.get("auto_assign_confirm", "sensor")).strip().lower()
+        if confirm not in ("sensor", "immediate", "off"):
+            confirm = "sensor"
+        self._auto_assign_confirm = confirm
+        self._sensor_timeout = int(config.get("sensor_timeout_seconds", 300))
+        # Slot sensor confirmation: watch per-slot filament presence reported by
+        # the AMS/MMU itself, so inserting a spool into a SLOT — not only loading
+        # it to the nozzle — confirms a pending auto-assign, and the slot that
+        # lights up names itself.
+        #
+        # slot_sensor_object accepts either one Klipper object holding a map of
+        # all slots, or a list of objects, one per slot. Left unset, it is
+        # autodetected from /printer/objects/list at start(); see
+        # SLOT_SENSOR_PRESETS.
+        raw_objects = config.get("slot_sensor_object")
+        if isinstance(raw_objects, str):
+            raw_objects = [raw_objects]
+        elif not isinstance(raw_objects, list):
+            raw_objects = []
+        self._slot_sensor_objects: list[str] = [
+            str(name).strip() for name in raw_objects if str(name).strip()
+        ]
+        self._slot_sensor_states_path = str(
+            config.get("slot_sensor_states_path", "") or ""
+        ).strip()
+        self._slot_sensor_autodetected = False
 
         self._slots: list[dict[str, Any]] = self._build_initial_slots()
         self._active_spool_id: int | None = None
         self._pending: dict[str, Any] | None = None
         self._pending_timer: asyncio.Task | None = None
+        self._filament_present: dict[str, Any] = {}
+        self._slot_sensor_present: dict[str, bool] = {}
+        # True when slot_sensor_object lists one object PER SLOT
+        # (AFC), False when a single object holds a map of all of them
+        # (QIDI, Happy Hare). Autodetection sets it; configuring the
+        # objects by hand must be able to say so too.
+        self._slot_sensor_per_slot: bool = bool(
+            config.get('slot_sensor_per_slot', False)
+        )
         self._lock = asyncio.Lock()
 
         self._connected = False
@@ -165,6 +228,155 @@ class Driver(BaseDriver):
             (item for item in self._slots if item.get("slot_index") == slot_index),
             None,
         )
+
+    @staticmethod
+    def _dig(obj: Any, path: str) -> Any:
+        """Walk a dotted path (e.g. 'slots.states') through nested dicts."""
+        cur = obj
+        for part in path.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
+    @staticmethod
+    def _slot_sensor_present_value(value: Any) -> bool | None:
+        """Presence from one raw sensor value; None when it says nothing.
+
+        Booleans are taken as-is. Numbers are present when > 0, which is what
+        every supported firmware means: QIDI 1/2 occupied, Happy Hare 1/2
+        available while -1 is *unknown* and 0 is empty. Plain truthiness would
+        turn that -1 into "occupied".
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        return None
+
+    def _sensor_key_to_slot_index(self, sensor_key: str) -> str | None:
+        """Map a sensor key ('slot3', 'gate3', 'AFC_stepper lane3', '3') to '0-3'."""
+        match = re.search(r"(\d+)\s*$", str(sensor_key))
+        if not match:
+            return None
+        n = match.group(1)
+        for slot in self._slots:
+            idx = str(slot.get("slot_index", ""))
+            if idx.endswith(f"-{n}") and str(slot.get("slot_kind") or "") == "tray":
+                return idx
+        return f"0-{n}"
+
+    async def _autodetect_slot_sensor(self) -> None:
+        """Pick a slot-presence source from the objects the printer exposes.
+
+        Only when the user has not configured one. Re-runs on every start so a
+        firmware or add-on change is picked up without editing the config.
+        """
+        if self._slot_sensor_objects and not self._slot_sensor_autodetected:
+            return
+        try:
+            objects = await self._discover_objects()
+        except Exception:
+            return
+
+        for preset in SLOT_SENSOR_PRESETS:
+            needle = str(preset["match"])
+            if preset["per_slot"]:
+                found = sorted(name for name in objects if name.startswith(needle))
+            else:
+                found = [name for name in objects if name == needle]
+            if not found:
+                continue
+            self._slot_sensor_objects = found
+            self._slot_sensor_per_slot = bool(preset["per_slot"])
+            if not self._slot_sensor_states_path:
+                self._slot_sensor_states_path = str(preset["path"])
+            self._slot_sensor_autodetected = True
+            logger.info(
+                "Slot sensor autodetected for printer %s: %s (path '%s')",
+                self.printer_id,
+                found if len(found) < 5 else f"{len(found)} objects",
+                self._slot_sensor_states_path,
+            )
+            return
+
+    async def _read_slot_sensor(self) -> dict[str, bool]:
+        """Current per-slot presence, keyed by whatever the firmware calls a slot."""
+        if not self._slot_sensor_objects:
+            return {}
+        query = "&".join(
+            name.replace(" ", "%20") for name in self._slot_sensor_objects
+        )
+        try:
+            payload = await self._request("GET", f"/printer/objects/query?{query}")
+        except Exception:
+            return {}
+        status = self._unwrap_result(payload).get("status")
+        if not isinstance(status, dict):
+            return {}
+
+        out: dict[str, bool] = {}
+        for name in self._slot_sensor_objects:
+            obj = status.get(name)
+            if not isinstance(obj, dict):
+                continue
+            raw = (
+                self._dig(obj, self._slot_sensor_states_path)
+                if self._slot_sensor_states_path
+                else obj
+            )
+
+            if getattr(self, "_slot_sensor_per_slot", False):
+                # One object per slot: the whole object is a single slot's state.
+                present = self._slot_sensor_present_value(raw)
+                if present is not None:
+                    out[name] = present
+                continue
+
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    present = self._slot_sensor_present_value(value)
+                    if present is not None:
+                        out[str(key)] = present
+            elif isinstance(raw, (list, tuple)):
+                # Indexed by slot number (Happy Hare gate_status).
+                for index, value in enumerate(raw):
+                    present = self._slot_sensor_present_value(value)
+                    if present is not None:
+                        out[str(index)] = present
+        return out
+
+    async def _poll_slot_sensor(self) -> None:
+        """Confirm a pending assignment when a slot goes empty -> present.
+
+        Complements the toolhead filament sensor: inserting a spool into an AMS
+        slot never reaches the nozzle sensor, but the AMS's own per-slot presence
+        does change, and the slot that lights up identifies itself.
+        """
+        current = await self._read_slot_sensor()
+        if not current:
+            return
+
+        previous = self._slot_sensor_present
+        self._slot_sensor_present = current
+
+        if self._pending is None or self._auto_assign_confirm != "sensor":
+            return
+        for sensor_key, present in current.items():
+            # Fire only on a real empty->present edge we have a baseline for, so
+            # pre-existing occupancy on the first poll never counts as insertion.
+            if present and previous.get(sensor_key) is False:
+                slot_index = self._sensor_key_to_slot_index(sensor_key)
+                if slot_index:
+                    logger.info(
+                        "Slot %s went present -> confirming pending spool on "
+                        "%s (printer %s)",
+                        sensor_key,
+                        slot_index,
+                        self.printer_id,
+                    )
+                    await self._complete_pending_assignment(slot_index=slot_index)
+                    break
 
     def _apply_extruder_spools(self, extruder_spools: dict[str, Any]) -> bool:
         """Mirror Moonraker's per-extruder spool map onto the toolhead slots."""
@@ -804,6 +1016,54 @@ class Driver(BaseDriver):
                 exc_info=True,
             )
 
+    async def _restore_slots_from_locations(self) -> None:
+        """Rebuild per-slot spool ownership from persisted spool locations.
+
+        Slot marks live in process memory, so a restart blanks them while the
+        database still knows where every spool sits. Read that back, otherwise
+        the first _emit_slots_update() persists four empty slots over the truth.
+        """
+        try:
+            async with async_session_maker() as db:
+                for slot in self._slots:
+                    slot_index = str(slot.get("slot_index") or "")
+                    if not slot_index or slot.get("spool_id") is not None:
+                        continue
+
+                    identifier = self._slot_location_identifier(slot_index)
+                    query = (
+                        select(Spool)
+                        .join(Location, Spool.location_id == Location.id)
+                        .where(Location.identifier == identifier)
+                        .order_by(Spool.id.desc())
+                        .limit(1)
+                    )
+                    archived = getattr(Spool, "archived", None)
+                    if archived is not None:
+                        query = query.where(archived.is_(False))
+
+                    spool = (await db.execute(query)).scalars().first()
+                    if spool is None:
+                        continue
+
+                    slot["present"] = True
+                    slot["spool_id"] = spool.id
+                    self._slot_to_filaman_spool[slot_index] = spool.id
+                    logger.info(
+                        "Restored spool %s into slot %s from its location "
+                        "(printer %s)",
+                        spool.id,
+                        slot_index,
+                        self.printer_id,
+                    )
+        except Exception:
+            logger.warning(
+                "Could not restore slot assignments from locations for "
+                "printer %s",
+                self.printer_id,
+                exc_info=True,
+            )
+
     async def _restore_spool_location(self, spool_id: int) -> None:
         if spool_id not in self._spool_original_known:
             return
@@ -871,6 +1131,18 @@ class Driver(BaseDriver):
         # After discovery, so the toolhead slots exist to be filled in.
         self._apply_extruder_spools(initial_extruder_spools)
 
+        # Slot marks are in-memory only; a restart would otherwise publish four
+        # empty slots and overwrite the persisted assignments.
+        await self._restore_slots_from_locations()
+
+        # Pick a slot-presence source unless one is configured, then seed the
+        # baseline so the first real insertion reads as an empty->present edge
+        # rather than pre-existing occupancy.
+        with contextlib.suppress(Exception):
+            await self._autodetect_slot_sensor()
+        with contextlib.suppress(Exception):
+            await self._poll_slot_sensor()
+
         async with self._lock:
             await self._reconcile_slot_locations()
 
@@ -907,6 +1179,7 @@ class Driver(BaseDriver):
         while self._running:
             try:
                 await self.refresh_status()
+                await self._poll_slot_sensor()
 
                 if not self._slot_targets:
                     self._poll_ticks += 1
@@ -940,9 +1213,29 @@ class Driver(BaseDriver):
         if slots_changed or previous_spool_id != self._active_spool_id:
             self._emit_slots_update()
 
+        filament_present = result.get("filament_present")
+        if not isinstance(filament_present, dict):
+            filament_present = {}
+        previous_present = self._filament_present
+        self._filament_present = dict(filament_present)
+
+        if self._pending is not None and self._auto_assign_confirm == "sensor":
+            for extruder, present in filament_present.items():
+                if present and not previous_present.get(extruder):
+                    await self._complete_pending_assignment(extruder)
+                    break
+
+        # Both consumers of this return value feed active_spool_id into
+        # _handle_slots_update() with an EMPTY slot list, which stamps it onto
+        # slot 0-0. Harmless for a toolhead-only printer, wrong for a tray box:
+        # it overwrites the real per-slot map on every health refresh.
+        has_tray_slots = any(
+            str(slot.get("slot_kind") or "") == "tray" for slot in self._slots
+        )
+
         return {
             "connected": self._connected,
-            "active_spool_id": self._active_spool_id,
+            "active_spool_id": None if has_tray_slots else self._active_spool_id,
             "extruder_spools": extruder_spools,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
@@ -1001,27 +1294,145 @@ class Driver(BaseDriver):
         slot_index: str | None = None,
         timeout_seconds: int | None = None,
     ) -> None:
+        if self._auto_assign_confirm == "off":
+            logger.info(
+                "Auto-assign disabled (auto_assign_confirm=off); ignoring spool %s "
+                "for printer %s",
+                spool_id,
+                self.printer_id,
+            )
+            return
+
         if self._pending_timer and not self._pending_timer.done():
             self._pending_timer.cancel()
+
+        target_slot: dict[str, Any] | None = None
+        if slot_index:
+            target_slot = self._find_slot(slot_index)
+        if target_slot is None and self._slots:
+            target_slot = self._slots[0]
+        target_extruder = self._slot_extruder(target_slot) if target_slot else None
+        filament_was_present = (
+            bool(self._filament_present.get(target_extruder))
+            if target_extruder is not None
+            else False
+        )
 
         self._pending = {
             "spool_id": spool_id,
             "filament_data": dict(filament_data or {}),
             "slot_index": slot_index,
             "started_at": _now_iso(),
+            "filament_was_present": filament_was_present,
         }
 
-        timeout = timeout_seconds if timeout_seconds is not None else 60
+        if self._auto_assign_confirm == "immediate":
+            await self._complete_pending_assignment()
+            return
+
+        # In sensor mode a real spool change (heat up, unload, insert) easily
+        # exceeds the device-level auto-assign timeout, so the driver uses its
+        # own window while waiting for the filament sensor.
+        timeout = self._sensor_timeout
+        if filament_was_present:
+            logger.info(
+                "Pending spool %s armed for printer %s while filament is already "
+                "present on '%s' — likely a control weighing; assignment completes "
+                "only after unload + reinsert within %s s",
+                spool_id,
+                self.printer_id,
+                target_extruder,
+                timeout,
+            )
+        else:
+            logger.info(
+                "Pending spool %s armed for printer %s — waiting for filament "
+                "insertion on '%s' (timeout %s s)",
+                spool_id,
+                self.printer_id,
+                target_extruder or "toolhead",
+                timeout,
+            )
         self._pending_timer = asyncio.create_task(self._pending_timeout_task(timeout))
+
+    def _clear_pending(self) -> None:
+        if self._pending_timer and not self._pending_timer.done():
+            self._pending_timer.cancel()
+        self._pending_timer = None
+        self._pending = None
+
+    async def _complete_pending_assignment(
+        self, extruder: str | None = None, slot_index: str | None = None
+    ) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+
+        spool_id = pending.get("spool_id")
+        if isinstance(spool_id, bool) or not isinstance(spool_id, int):
+            self._clear_pending()
+            return
+
+        slot: dict[str, Any] | None = None
+        # An explicit slot_index (e.g. from the box slot sensor) wins over the
+        # pending's own hint, which is usually None for a scale weighing.
+        resolved_index = slot_index or pending.get("slot_index")
+        if resolved_index:
+            slot = self._find_slot(resolved_index)
+        if slot is None and extruder is not None:
+            for candidate in self._slots:
+                if self._slot_extruder(candidate) == extruder:
+                    slot = candidate
+                    break
+        if slot is None and self._slots:
+            slot = self._slots[0]
+        if slot is None:
+            logger.info(
+                "Pending spool %s: no slot available to complete auto-assign "
+                "for printer %s",
+                spool_id,
+                self.printer_id,
+            )
+            self._clear_pending()
+            return
+
+        ams_id, tray_id = self._slot_to_ids(slot.get("slot_index", "0-0"))
+        filament_data = pending.get("filament_data") or {}
+        self._clear_pending()
+        try:
+            await self.send_filament_to_tray(
+                ams_id, tray_id, filament_data, spool_id=spool_id
+            )
+            logger.info(
+                "Auto-assign completed for spool %s on slot %s-%s (printer %s)",
+                spool_id,
+                ams_id,
+                tray_id,
+                self.printer_id,
+            )
+        except Exception:
+            logger.exception(
+                "Auto-assign completion failed for spool %s (printer %s)",
+                spool_id,
+                self.printer_id,
+            )
 
     async def _pending_timeout_task(self, timeout_seconds: int) -> None:
         await asyncio.sleep(timeout_seconds)
         if self._pending is not None:
-            logger.info(
-                "Pending spool %s timed out for printer %s",
-                self._pending.get("spool_id"),
-                self.printer_id,
-            )
+            if self._pending.get("filament_was_present"):
+                logger.info(
+                    "Pending spool %s expired for printer %s without an unload — "
+                    "treated as a control weighing, active spool unchanged",
+                    self._pending.get("spool_id"),
+                    self.printer_id,
+                )
+            else:
+                logger.info(
+                    "Pending spool %s timed out for printer %s",
+                    self._pending.get("spool_id"),
+                    self.printer_id,
+                )
             self._pending = None
 
     def health(self) -> dict[str, Any]:
@@ -1035,6 +1446,17 @@ class Driver(BaseDriver):
             "active_spool_id": self._active_spool_id,
             "pending": self._pending is not None,
             "pending_spool_id": self._pending.get("spool_id") if self._pending else None,
+            "pending_started_at": (
+                self._pending.get("started_at") if self._pending else None
+            ),
+            "pending_requires_unload": (
+                bool(self._pending.get("filament_was_present"))
+                if self._pending
+                else None
+            ),
+            "auto_assign_confirm": self._auto_assign_confirm,
+            "sensor_timeout_seconds": self._sensor_timeout,
+            "filament_present": self._filament_present,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "slot_count": len(self._slots),

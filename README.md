@@ -59,6 +59,40 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
 - If no tray-related objects are present, only toolhead slots are shown.
 - `slot_targets` overrides auto-discovery (manual mode).
 
+## Auto-assign confirmation
+
+When FilaMan arms a pending spool (e.g. after weighing a tagged spool on the scale), the driver
+waits for the printer to confirm where that spool went.
+
+- `auto_assign_confirm`
+  - `sensor` (default) — wait for filament to appear. Two sources are watched: the toolhead
+    filament sensor, and the per-slot presence reported by an AMS/MMU. The slot source is the
+    useful one on a multi-slot machine: inserting a spool into a slot never reaches the toolhead
+    sensor, and the slot that goes empty → present *identifies itself*, so the spool binds to the
+    slot it was physically put in — no loading to the nozzle needed.
+  - `immediate` — assign as soon as the spool is armed.
+  - `off` — no pending auto-assign.
+- `sensor_timeout_seconds` (default `300`) — how long to wait before dropping a pending assign.
+
+### Slot presence source
+
+Autodetected from `/printer/objects/list`; only set these to override.
+
+| System | Object | Path | Values |
+|---|---|---|---|
+| QIDI BOX | `multi_color_controller` | `slots.states` | dict; `0` empty, `1` present, `2` loaded |
+| Happy Hare | `mmu` | `gate_status` | list; `-1` unknown, `0` empty, `1`/`2` available |
+| AFC | `AFC_stepper <lane>` (one per slot) | `prep` | boolean |
+
+- `slot_sensor_object` — a single object, or a list of objects when there is one per slot.
+- `slot_sensor_states_path` — dotted path to the presence data inside the object.
+- `slot_sensor_per_slot` — set when the list is one object per slot rather than one object
+  mapping all of them.
+
+A slot counts as occupied when its value is a `true` boolean or a number **greater than zero**.
+Plain truthiness is deliberately not used: Happy Hare reports `-1` for *unknown*, which would
+otherwise read as occupied.
+
 ## Placeholders for `assign_gcode`
 
 - `{spool_id}`
