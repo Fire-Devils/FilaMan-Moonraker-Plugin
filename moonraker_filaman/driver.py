@@ -5,7 +5,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from sqlalchemy import select
 
@@ -19,8 +19,25 @@ from app.services.spool_service import SpoolService
 
 logger = logging.getLogger(__name__)
 
+# Object-name prefixes for the multi-material add-ons. Slot-sensor detection and
+# tray discovery both key off these; they used to spell the AFC one differently
+# ("AFC_stepper " vs "afc_stepper ") and str.startswith is case sensitive, so at
+# most one of the two could ever match. Compared casefolded everywhere.
+AFC_LANE_PREFIX = "afc_stepper "
+MMU_GATE_PREFIX = "mmu_gate "
+
+
+def _name_matches(name: str, needle: str, prefix: bool) -> bool:
+    """Case-insensitive object-name match; prefix for per-lane objects."""
+    lowered = str(name).casefold()
+    target = str(needle).casefold()
+    return lowered.startswith(target) if prefix else lowered == target
+
+
 # Per-slot presence as reported by the AMS/MMU firmwares this plugin targets.
-# (object glob, path within the object, one object per slot?)
+# keys: match    exact object name, or a name prefix when per_slot is set
+#       path     dotted path to the presence data inside the object
+#       per_slot one object per slot (True) or one object mapping all of them
 # Values are read with _slot_sensor_present_value(): numbers > 0 mean present,
 # booleans are taken as-is. That is deliberate — Happy Hare uses -1 for
 # "unknown", which truthiness would report as occupied.
@@ -33,6 +50,8 @@ SLOT_SENSOR_PRESETS: list[dict[str, Any]] = [
     },
     # Happy Hare: gate_status is a LIST indexed by gate.
     # -1 unknown, 0 empty, 1 available, 2 available from buffer.
+    # Note: on a setup without pre-gate/gate sensors Happy Hare updates this on
+    # command rather than on insertion, so confirmation-by-insertion needs them.
     {
         "match": "mmu",
         "per_slot": False,
@@ -40,7 +59,7 @@ SLOT_SENSOR_PRESETS: list[dict[str, Any]] = [
     },
     # AFC: one object per lane, each with a boolean `prep`.
     {
-        "match": "AFC_stepper ",
+        "match": AFC_LANE_PREFIX,
         "per_slot": True,
         "path": "prep",
     },
@@ -97,6 +116,15 @@ class Driver(BaseDriver):
             config.get("slot_sensor_states_path", "") or ""
         ).strip()
         self._slot_sensor_autodetected = False
+        # Whether the PATH came from a preset rather than the user. Re-detection
+        # may overwrite an autodetected path but must never clobber a pinned one.
+        self._slot_sensor_path_autodetected = False
+        # Canonical slot number -> whatever the firmware calls that slot, kept
+        # for log messages only.
+        self._slot_sensor_labels: dict[str, str] = {}
+        # Keys of conditions already reported, so a permanent misconfiguration
+        # warns once instead of every 5 s forever.
+        self._warned_once: set[str] = set()
 
         self._slots: list[dict[str, Any]] = self._build_initial_slots()
         self._active_spool_id: int | None = None
@@ -254,43 +282,73 @@ class Driver(BaseDriver):
             return value > 0
         return None
 
-    def _sensor_key_to_slot_index(self, sensor_key: str) -> str | None:
-        """Map a sensor key ('slot3', 'gate3', 'AFC_stepper lane3', '3') to '0-3'."""
-        match = re.search(r"(\d+)\s*$", str(sensor_key))
-        if not match:
+    def _warn_once(self, key: str, message: str, *args: Any) -> None:
+        """Log a warning the first time a condition appears, then stay quiet.
+
+        These fire from a 5 s poll loop, so an unconditional warning would be a
+        log flood; staying silent instead is what made a misconfigured sensor
+        undiagnosable. `_clear_warn_once` re-arms it once the condition clears.
+        """
+        if key in self._warned_once:
+            return
+        self._warned_once.add(key)
+        logger.warning(message, *args)
+
+    def _clear_warn_once(self, key: str) -> None:
+        self._warned_once.discard(key)
+
+    def _sensor_key_to_slot_index(self, slot_no: str) -> str | None:
+        """Map a canonical slot number to a configured tray slot_index.
+
+        Returns None when no tray slot carries that number. That is a refusal,
+        not a hint: fabricating an index here used to resolve to a toolhead in
+        _complete_pending_assignment(), silently binding the spool to the wrong
+        place on any printer whose trays were not discovered.
+        """
+        n = str(slot_no).strip()
+        if not n.isdigit():
             return None
-        n = match.group(1)
         for slot in self._slots:
             idx = str(slot.get("slot_index", ""))
             if idx.endswith(f"-{n}") and str(slot.get("slot_kind") or "") == "tray":
                 return idx
-        return f"0-{n}"
+        return None
 
     async def _autodetect_slot_sensor(self) -> None:
         """Pick a slot-presence source from the objects the printer exposes.
 
-        Only when the user has not configured one. Re-runs on every start so a
-        firmware or add-on change is picked up without editing the config.
+        Only when the user has not configured one. Re-runs on every start and
+        re-adopts the preset WHOLE — objects, path and per_slot together — so a
+        firmware or add-on change is picked up without editing the config. A
+        user-supplied path is never overwritten.
         """
         if self._slot_sensor_objects and not self._slot_sensor_autodetected:
             return
         try:
             objects = await self._discover_objects()
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Slot sensor autodetection could not list objects for printer %s: %s",
+                self.printer_id,
+                exc,
+            )
             return
 
         for preset in SLOT_SENSOR_PRESETS:
-            needle = str(preset["match"])
-            if preset["per_slot"]:
-                found = sorted(name for name in objects if name.startswith(needle))
-            else:
-                found = [name for name in objects if name == needle]
+            per_slot = bool(preset["per_slot"])
+            found = sorted(
+                name
+                for name in objects
+                if _name_matches(name, str(preset["match"]), per_slot)
+            )
             if not found:
                 continue
             self._slot_sensor_objects = found
-            self._slot_sensor_per_slot = bool(preset["per_slot"])
-            if not self._slot_sensor_states_path:
+            self._slot_sensor_per_slot = per_slot
+            # Re-adopt the path too, unless the user pinned one by hand.
+            if self._slot_sensor_path_autodetected or not self._slot_sensor_states_path:
                 self._slot_sensor_states_path = str(preset["path"])
+                self._slot_sensor_path_autodetected = True
             self._slot_sensor_autodetected = True
             logger.info(
                 "Slot sensor autodetected for printer %s: %s (path '%s')",
@@ -300,50 +358,111 @@ class Driver(BaseDriver):
             )
             return
 
+        logger.warning(
+            "No slot sensor preset matched the %d objects on printer %s; "
+            "auto-assign cannot be confirmed by slot insertion. Set "
+            "slot_sensor_object/slot_sensor_states_path to use one explicitly.",
+            len(objects),
+            self.printer_id,
+        )
+
     async def _read_slot_sensor(self) -> dict[str, bool]:
-        """Current per-slot presence, keyed by whatever the firmware calls a slot."""
+        """Per-slot presence, keyed by CANONICAL SLOT NUMBER as a string.
+
+        The key is normalised here rather than left as whatever the firmware
+        calls a slot, because those names do not carry a usable number: AFC
+        lanes are commonly lane1..lane4 while the trays they map to are indexed
+        from zero, so reading a number out of the name is off by one.
+
+        Sources, in the shape each firmware uses:
+          dict     -> the trailing number of each key ("slot2" -> "2")
+          list     -> the position in the list (Happy Hare gate_status)
+          per slot -> the position in the configured/sorted object list
+        """
         if not self._slot_sensor_objects:
             return {}
-        query = "&".join(
-            name.replace(" ", "%20") for name in self._slot_sensor_objects
-        )
+        if not self._slot_sensor_states_path:
+            self._warn_once(
+                "slot_sensor_no_path",
+                "slot_sensor_object is set for printer %s but slot_sensor_states_path "
+                "is empty; refusing to guess. Set the path, or clear both to let "
+                "autodetection pick a preset.",
+                self.printer_id,
+            )
+            return {}
+
+        query = "&".join(quote(name, safe="") for name in self._slot_sensor_objects)
         try:
             payload = await self._request("GET", f"/printer/objects/query?{query}")
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Slot sensor query failed for printer %s: %s", self.printer_id, exc
+            )
             return {}
         status = self._unwrap_result(payload).get("status")
         if not isinstance(status, dict):
+            self._warn_once(
+                "slot_sensor_bad_status",
+                "Slot sensor query for printer %s returned no status object",
+                self.printer_id,
+            )
             return {}
 
         out: dict[str, bool] = {}
-        for name in self._slot_sensor_objects:
+        labels: dict[str, str] = {}
+        seen_object = False
+        for position, name in enumerate(self._slot_sensor_objects):
             obj = status.get(name)
             if not isinstance(obj, dict):
                 continue
-            raw = (
-                self._dig(obj, self._slot_sensor_states_path)
-                if self._slot_sensor_states_path
-                else obj
-            )
+            seen_object = True
+            raw = self._dig(obj, self._slot_sensor_states_path)
 
-            if getattr(self, "_slot_sensor_per_slot", False):
-                # One object per slot: the whole object is a single slot's state.
+            if self._slot_sensor_per_slot:
+                # One object per slot: raw is that slot's own presence value.
                 present = self._slot_sensor_present_value(raw)
                 if present is not None:
-                    out[name] = present
+                    key = str(position)
+                    out[key] = present
+                    labels[key] = name
                 continue
 
             if isinstance(raw, dict):
-                for key, value in raw.items():
+                for raw_key, value in raw.items():
                     present = self._slot_sensor_present_value(value)
-                    if present is not None:
-                        out[str(key)] = present
+                    if present is None:
+                        continue
+                    match = re.search(r"(\d+)\s*$", str(raw_key))
+                    if not match:
+                        continue
+                    key = match.group(1)
+                    out[key] = present
+                    labels[key] = str(raw_key)
             elif isinstance(raw, (list, tuple)):
-                # Indexed by slot number (Happy Hare gate_status).
                 for index, value in enumerate(raw):
                     present = self._slot_sensor_present_value(value)
                     if present is not None:
-                        out[str(index)] = present
+                        key = str(index)
+                        out[key] = present
+                        labels[key] = f"{self._slot_sensor_states_path}[{index}]"
+
+        if not out:
+            # A successful query that yields nothing means the object or the path
+            # is wrong, or the values are in a shape we do not understand. All
+            # three are silent forever otherwise.
+            self._warn_once(
+                "slot_sensor_empty",
+                "Slot sensor for printer %s answered but produced no usable slot "
+                "states (objects=%s, path='%s', object found=%s). Auto-assign "
+                "cannot be confirmed by slot insertion.",
+                self.printer_id,
+                self._slot_sensor_objects,
+                self._slot_sensor_states_path,
+                seen_object,
+            )
+        else:
+            self._clear_warn_once("slot_sensor_empty")
+            self._slot_sensor_labels = labels
         return out
 
     async def _poll_slot_sensor(self) -> None:
@@ -362,21 +481,51 @@ class Driver(BaseDriver):
 
         if self._pending is None or self._auto_assign_confirm != "sensor":
             return
-        for sensor_key, present in current.items():
-            # Fire only on a real empty->present edge we have a baseline for, so
-            # pre-existing occupancy on the first poll never counts as insertion.
-            if present and previous.get(sensor_key) is False:
-                slot_index = self._sensor_key_to_slot_index(sensor_key)
-                if slot_index:
-                    logger.info(
-                        "Slot %s went present -> confirming pending spool on "
-                        "%s (printer %s)",
-                        sensor_key,
-                        slot_index,
-                        self.printer_id,
-                    )
-                    await self._complete_pending_assignment(slot_index=slot_index)
-                    break
+
+        # Fire only on a real empty->present edge we have a baseline for, so
+        # pre-existing occupancy on the first poll never counts as insertion.
+        edges = [
+            key
+            for key, present in current.items()
+            if present and previous.get(key) is False
+        ]
+        if not edges:
+            return
+        if len(edges) > 1:
+            # Several slots appearing at once cannot name the one the user meant
+            # — e.g. the AMS coming back after a power cycle. Refusing keeps the
+            # pending alive for the next, unambiguous edge.
+            logger.warning(
+                "Slots %s went present together on printer %s; ambiguous, not "
+                "confirming pending spool %s",
+                [self._slot_sensor_labels.get(k, k) for k in edges],
+                self.printer_id,
+                self._pending.get("spool_id"),
+            )
+            return
+
+        key = edges[0]
+        slot_index = self._sensor_key_to_slot_index(key)
+        label = self._slot_sensor_labels.get(key, key)
+        if slot_index is None:
+            self._warn_once(
+                "slot_sensor_unmapped",
+                "Slot %s went present on printer %s but no tray slot carries "
+                "number %s (slots: %s). Define slot_targets for this printer — "
+                "not confirming, to avoid binding the spool to the wrong slot.",
+                label,
+                self.printer_id,
+                key,
+                [s.get("slot_index") for s in self._slots],
+            )
+            return
+        logger.info(
+            "Slot %s went present -> confirming pending spool on %s (printer %s)",
+            label,
+            slot_index,
+            self.printer_id,
+        )
+        await self._complete_pending_assignment(slot_index=slot_index)
 
     def _apply_extruder_spools(self, extruder_spools: dict[str, Any]) -> bool:
         """Mirror Moonraker's per-extruder spool map onto the toolhead slots."""
@@ -419,12 +568,18 @@ class Driver(BaseDriver):
                 return 0
 
             section_names = [str(name) for name in orig.keys()]
-            afc_sections = [name for name in section_names if name.startswith("afc_stepper ")]
+            afc_sections = [
+                name
+                for name in section_names
+                if _name_matches(name, AFC_LANE_PREFIX, True)
+            ]
             if afc_sections:
                 return len(afc_sections)
 
             mmu_gate_sections = [
-                name for name in section_names if name.startswith("mmu_gate ")
+                name
+                for name in section_names
+                if _name_matches(name, MMU_GATE_PREFIX, True)
             ]
             if mmu_gate_sections:
                 return len(mmu_gate_sections)
@@ -475,12 +630,31 @@ class Driver(BaseDriver):
                 }
             )
 
-        tray_count = 0
-        afc_object_count = len([name for name in objects if name.startswith("afc_stepper ")])
-        mmu_object_count = len([name for name in objects if name.startswith("mmu_gate ")])
+        afc_object_count = len(
+            [name for name in objects if _name_matches(name, AFC_LANE_PREFIX, True)]
+        )
+        mmu_object_count = len(
+            [name for name in objects if _name_matches(name, MMU_GATE_PREFIX, True)]
+        )
         tray_count = max(afc_object_count, mmu_object_count)
         if tray_count == 0:
             tray_count = await self._discover_tray_count_from_config()
+        if tray_count == 0 and self._slot_count > 1:
+            # An AMS that exposes neither afc_stepper nor mmu_gate — a QIDI BOX,
+            # for one — is invisible to every check above, leaving a multi-slot
+            # printer with only a toolhead slot. Fall back to the configured
+            # slot_count, which is what that key is for.
+            #
+            # Deliberately NOT derived from the slot sensor: a QIDI BOX reports
+            # slot0..slot15 regardless of how many boxes are attached, so counting
+            # its keys would invent twelve trays that do not exist.
+            tray_count = self._slot_count
+            logger.info(
+                "No AFC/MMU objects on printer %s; taking %d tray slots from "
+                "slot_count",
+                self.printer_id,
+                tray_count,
+            )
 
         for idx in range(tray_count):
             discovered.append(
@@ -932,7 +1106,15 @@ class Driver(BaseDriver):
             await self._move_spool_to_slot_location(spool_id, slot_index)
             self._slot_to_filaman_spool[slot_index] = spool_id
 
-    async def _move_spool_to_slot_location(self, spool_id: int, slot_index: str) -> None:
+    async def _move_spool_to_slot_location(
+        self, spool_id: int, slot_index: str
+    ) -> bool:
+        """Point the spool's Location row at this slot. True when it now matches.
+
+        The caller records slot ownership only on True: doing it unconditionally
+        made a failed move permanently invisible, because the reconcile pass then
+        treats the slot as already correct.
+        """
         slot_location_name = self._slot_location_name(slot_index)
         slot_location_identifier = self._slot_location_identifier(slot_index)
 
@@ -944,7 +1126,7 @@ class Driver(BaseDriver):
                         "Spool %s not found while updating Moonraker location",
                         spool_id,
                     )
-                    return
+                    return False
 
                 result = await db.execute(
                     select(Location)
@@ -993,12 +1175,12 @@ class Driver(BaseDriver):
                         self.printer_id,
                         slot_index,
                     )
-                    return
+                    return False
 
                 if spool.location_id == location.id:
                     if location_changed:
                         await db.commit()
-                    return
+                    return True
 
                 await SpoolService(db).move_location(
                     spool,
@@ -1007,6 +1189,7 @@ class Driver(BaseDriver):
                     source="driver",
                     note=f"Assigned to {slot_location_name}",
                 )
+                return True
         except Exception as exc:
             logger.error(
                 "Failed to move spool %s to Moonraker slot %s: %s",
@@ -1015,21 +1198,37 @@ class Driver(BaseDriver):
                 exc,
                 exc_info=True,
             )
+        return False
 
     async def _restore_slots_from_locations(self) -> None:
         """Rebuild per-slot spool ownership from persisted spool locations.
 
         Slot marks live in process memory, so a restart blanks them while the
         database still knows where every spool sits. Read that back, otherwise
-        the first _emit_slots_update() persists four empty slots over the truth.
+        the first _emit_slots_update() publishes empty slots, which the backend
+        then stores over the persisted assignments.
+
+        Failures are per slot: one bad row must not abandon the slots after it,
+        which would produce exactly the blanking this exists to prevent, just
+        for a subset and with a message that says nothing was restored.
         """
         try:
-            async with async_session_maker() as db:
-                for slot in self._slots:
-                    slot_index = str(slot.get("slot_index") or "")
-                    if not slot_index or slot.get("spool_id") is not None:
-                        continue
+            session = async_session_maker()
+        except Exception:
+            logger.warning(
+                "Could not open a session to restore slot assignments for "
+                "printer %s",
+                self.printer_id,
+                exc_info=True,
+            )
+            return
 
+        async with session as db:
+            for slot in self._slots:
+                slot_index = str(slot.get("slot_index") or "")
+                if not slot_index or slot.get("spool_id") is not None:
+                    continue
+                try:
                     identifier = self._slot_location_identifier(slot_index)
                     query = (
                         select(Spool)
@@ -1038,13 +1237,37 @@ class Driver(BaseDriver):
                         .order_by(Spool.id.desc())
                         .limit(1)
                     )
+                    # `archived` is the host application's column, not ours; if it
+                    # is ever renamed the filter drops rather than crashing, so
+                    # say when that happens instead of silently restoring
+                    # archived spools into slots.
                     archived = getattr(Spool, "archived", None)
                     if archived is not None:
                         query = query.where(archived.is_(False))
+                    else:
+                        self._warn_once(
+                            "spool_archived_missing",
+                            "Spool model has no 'archived' column; archived spools "
+                            "may be restored into slots on printer %s",
+                            self.printer_id,
+                        )
 
-                    spool = (await db.execute(query)).scalars().first()
-                    if spool is None:
+                    rows = (await db.execute(query.limit(2))).scalars().all()
+                    if not rows:
                         continue
+                    if len(rows) > 1:
+                        # Two spools claiming one slot is stale data, and picking
+                        # by id is arbitrary. Say so rather than guessing quietly.
+                        logger.warning(
+                            "Slot %s on printer %s is claimed by %d spools (%s); "
+                            "restoring the newest, but the location data needs "
+                            "cleaning up",
+                            slot_index,
+                            self.printer_id,
+                            len(rows),
+                            [r.id for r in rows],
+                        )
+                    spool = rows[0]
 
                     slot["present"] = True
                     slot["spool_id"] = spool.id
@@ -1056,13 +1279,14 @@ class Driver(BaseDriver):
                         slot_index,
                         self.printer_id,
                     )
-        except Exception:
-            logger.warning(
-                "Could not restore slot assignments from locations for "
-                "printer %s",
-                self.printer_id,
-                exc_info=True,
-            )
+                except Exception:
+                    logger.warning(
+                        "Could not restore slot %s from its location for "
+                        "printer %s; continuing with the remaining slots",
+                        slot_index,
+                        self.printer_id,
+                        exc_info=True,
+                    )
 
     async def _restore_spool_location(self, spool_id: int) -> None:
         if spool_id not in self._spool_original_known:
@@ -1121,6 +1345,11 @@ class Driver(BaseDriver):
             self._active_spool_id = result.get("spool_id")
             if isinstance(result.get("extruder_spools"), dict):
                 initial_extruder_spools = result["extruder_spools"]
+            # Seed the toolhead baseline here, not on the first poll. Left empty,
+            # every key reads as "absent" and the first poll after start looks
+            # like an insertion edge.
+            if isinstance(result.get("filament_present"), dict):
+                self._filament_present = dict(result["filament_present"])
             self._last_error = None
             self._last_success_at = _now_iso()
         except Exception as exc:
@@ -1221,7 +1450,11 @@ class Driver(BaseDriver):
 
         if self._pending is not None and self._auto_assign_confirm == "sensor":
             for extruder, present in filament_present.items():
-                if present and not previous_present.get(extruder):
+                # `is False`, not truthiness, matching _poll_slot_sensor: a
+                # MISSING baseline key must not read as "was empty". Otherwise
+                # the first poll after a restart, or one response that omitted
+                # filament_present, completes a pending with nothing inserted.
+                if present and previous_present.get(extruder) is False:
                     await self._complete_pending_assignment(extruder)
                     break
 
@@ -1284,8 +1517,15 @@ class Driver(BaseDriver):
                 filament_data=filament_data,
             )
             await self._mark_slot(slot_index, filament_data, spool_id=spool_id)
-            await self._move_spool_to_slot_location(spool_id, slot_index)
-            self._slot_to_filaman_spool[slot_index] = spool_id
+            moved = await self._move_spool_to_slot_location(spool_id, slot_index)
+            if moved:
+                self._slot_to_filaman_spool[slot_index] = spool_id
+            else:
+                # Recording the mapping after a failed move would make
+                # _reconcile_slot_locations() consider this slot already correct
+                # and skip it forever, leaving the spool's location permanently
+                # wrong with only one error line at the time it happened.
+                self._slot_to_filaman_spool.pop(slot_index, None)
 
     async def assign_pending_spool(
         self,
@@ -1312,11 +1552,16 @@ class Driver(BaseDriver):
         if target_slot is None and self._slots:
             target_slot = self._slots[0]
         target_extruder = self._slot_extruder(target_slot) if target_slot else None
-        filament_was_present = (
-            bool(self._filament_present.get(target_extruder))
-            if target_extruder is not None
-            else False
-        )
+        if target_extruder is not None:
+            filament_was_present = bool(self._filament_present.get(target_extruder))
+        else:
+            # Tray slots have no extruder of their own, so asking one for its
+            # filament state returns nothing and the control-weighing guard below
+            # was dead on every tray-only printer. Any loaded toolhead will do:
+            # the question is "was something already loaded when this was armed".
+            filament_was_present = any(
+                bool(v) for v in self._filament_present.values()
+            )
 
         self._pending = {
             "spool_id": spool_id,
@@ -1331,9 +1576,12 @@ class Driver(BaseDriver):
             return
 
         # In sensor mode a real spool change (heat up, unload, insert) easily
-        # exceeds the device-level auto-assign timeout, so the driver uses its
-        # own window while waiting for the filament sensor.
+        # exceeds the device-level auto-assign timeout, so the driver's own
+        # window acts as a FLOOR. A caller asking for longer still gets longer;
+        # only a too-short request is raised, which is the case this exists for.
         timeout = self._sensor_timeout
+        if timeout_seconds is not None:
+            timeout = max(int(timeout_seconds), self._sensor_timeout)
         if filament_was_present:
             logger.info(
                 "Pending spool %s armed for printer %s while filament is already "
@@ -1374,20 +1622,52 @@ class Driver(BaseDriver):
             return
 
         slot: dict[str, Any] | None = None
-        # An explicit slot_index (e.g. from the box slot sensor) wins over the
+        # An explicit slot_index (e.g. from the slot sensor) wins over the
         # pending's own hint, which is usually None for a scale weighing.
         resolved_index = slot_index or pending.get("slot_index")
         if resolved_index:
             slot = self._find_slot(resolved_index)
+            if slot is None:
+                # Naming a slot that does not exist is a bug somewhere upstream;
+                # quietly assigning to a different one writes a wrong spool->slot
+                # binding that nothing later corrects.
+                logger.warning(
+                    "Pending spool %s names slot %s, which this printer (%s) does "
+                    "not have (slots: %s); not assigning",
+                    spool_id,
+                    resolved_index,
+                    self.printer_id,
+                    [s.get("slot_index") for s in self._slots],
+                )
+                self._clear_pending()
+                return
         if slot is None and extruder is not None:
             for candidate in self._slots:
                 if self._slot_extruder(candidate) == extruder:
                     slot = candidate
                     break
-        if slot is None and self._slots:
-            slot = self._slots[0]
         if slot is None:
-            logger.info(
+            has_trays = any(
+                str(s.get("slot_kind") or "") == "tray" for s in self._slots
+            )
+            if has_trays:
+                # A toolhead-wide signal cannot say which tray the spool came
+                # from. Falling back to the first slot used to bind it to tray 0
+                # regardless of reality. Keep the pending instead — a slot-sensor
+                # edge can still confirm it before the timeout.
+                logger.warning(
+                    "Pending spool %s for printer %s cannot be placed: the "
+                    "confirmation did not name a slot and this printer has trays. "
+                    "Waiting for a slot sensor edge instead.",
+                    spool_id,
+                    self.printer_id,
+                )
+                return
+            if self._slots:
+                # Single-toolhead printer: there is only one place it can go.
+                slot = self._slots[0]
+        if slot is None:
+            logger.warning(
                 "Pending spool %s: no slot available to complete auto-assign "
                 "for printer %s",
                 spool_id,
@@ -1428,8 +1708,13 @@ class Driver(BaseDriver):
                     self.printer_id,
                 )
             else:
-                logger.info(
-                    "Pending spool %s timed out for printer %s",
+                # Warning, not info: this is the failure branch of the feature,
+                # it fires at most once per weighing, and at the production log
+                # level info is invisible — so an auto-assign that never lands
+                # left no trace at all.
+                logger.warning(
+                    "Pending spool %s timed out for printer %s without "
+                    "confirmation; the spool was not assigned to a slot",
                     self._pending.get("spool_id"),
                     self.printer_id,
                 )
@@ -1457,6 +1742,13 @@ class Driver(BaseDriver):
             "auto_assign_confirm": self._auto_assign_confirm,
             "sensor_timeout_seconds": self._sensor_timeout,
             "filament_present": self._filament_present,
+            # The slot-sensor subsystem's own state. health() is the one channel
+            # the UI already reads, so leaving it out meant a misconfigured
+            # sensor was invisible everywhere.
+            "slot_sensor_objects": self._slot_sensor_objects,
+            "slot_sensor_states_path": self._slot_sensor_states_path,
+            "slot_sensor_autodetected": self._slot_sensor_autodetected,
+            "slot_sensor_present": self._slot_sensor_present,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "slot_count": len(self._slots),

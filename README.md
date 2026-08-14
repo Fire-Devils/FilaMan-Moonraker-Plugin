@@ -72,26 +72,58 @@ waits for the printer to confirm where that spool went.
     slot it was physically put in — no loading to the nozzle needed.
   - `immediate` — assign as soon as the spool is armed.
   - `off` — no pending auto-assign.
-- `sensor_timeout_seconds` (default `300`) — how long to wait before dropping a pending assign.
+- `sensor_timeout_seconds` (default `300`) — how long a pending waits before it is dropped. A
+  caller-supplied timeout is honoured when it is *longer*; this value is a floor, because a real
+  spool change (heat up, unload, insert) outlasts a device-level auto-assign window.
+
+On a printer that has tray slots, a toolhead-sensor edge alone never completes an assignment: a
+toolhead-wide signal cannot say which tray the spool came from, so the pending is kept until a
+slot sensor names one, or until it times out. The timeout is logged at warning level.
 
 ### Slot presence source
 
-Autodetected from `/printer/objects/list`; only set these to override.
+Autodetected from `/printer/objects/list`. Set these only to override it — and if you set the
+object by hand you must set the path too, since detection fills in the pair or neither.
 
 | System | Object | Path | Values |
 |---|---|---|---|
 | QIDI BOX | `multi_color_controller` | `slots.states` | dict; `0` empty, `1` present, `2` loaded |
 | Happy Hare | `mmu` | `gate_status` | list; `-1` unknown, `0` empty, `1`/`2` available |
-| AFC | `AFC_stepper <lane>` (one per slot) | `prep` | boolean |
+| AFC | `AFC_stepper <lane>`, one object per lane | `prep` | boolean |
 
-- `slot_sensor_object` — a single object, or a list of objects when there is one per slot.
+- `slot_sensor_object` — a single object, or a list of objects when there is one per slot. Names
+  are matched case-insensitively against the printer's object list; as an override, give the full
+  name of each object (no wildcards).
 - `slot_sensor_states_path` — dotted path to the presence data inside the object.
 - `slot_sensor_per_slot` — set when the list is one object per slot rather than one object
-  mapping all of them.
+  mapping all of them. Autodetection sets it for you.
 
 A slot counts as occupied when its value is a `true` boolean or a number **greater than zero**.
 Plain truthiness is deliberately not used: Happy Hare reports `-1` for *unknown*, which would
-otherwise read as occupied.
+otherwise read as occupied. A value in any other shape (a string, say) drops that slot from the
+map entirely rather than reporting it empty, so it can never produce a false insertion.
+
+Slots are identified by number: the trailing digits of a key (`slot2` → `2`), the position in a
+list, or the position in the object list when there is one object per lane. AFC lanes are commonly
+named `lane1`…`lane4` while the trays they map to are indexed from zero, which is why the lane
+*name* is not used for this.
+
+**The number has to match a tray slot that this driver knows about**, otherwise the spool is not
+assigned — deliberately, since guessing writes a wrong spool→slot binding that nothing later
+corrects. Tray slots come from AFC/MMU objects, from `slot_targets`, or from `slot_count`. An AMS
+that exposes neither AFC nor MMU objects — a QIDI BOX, for one — is invisible to discovery, so set
+`slot_count` (or `slot_targets`) to the number of slots it has, or confirmation will refuse and
+say so in the log.
+
+### Diagnostics
+
+Slot-sensor state is reported in the driver health payload (`slot_sensor_objects`,
+`slot_sensor_states_path`, `slot_sensor_autodetected`, `slot_sensor_present`). A misconfigured
+object or path warns once rather than every poll.
+
+Note that on a printer with tray slots the driver does not report a printer-wide `active_spool_id`
+from its status refresh — that value cannot name a tray, and reporting it caused it to be recorded
+against the first slot. It is still present in the health payload.
 
 ## Placeholders for `assign_gcode`
 

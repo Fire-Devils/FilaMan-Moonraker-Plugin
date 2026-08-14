@@ -1,0 +1,37 @@
+{
+  "_comment": "Verbatim /printer/objects/query?multi_color_controller from a QIDI Q2 with one QIDI BOX attached, 2026-08-14. All four physical slots loaded, slot0 also loaded to the toolhead. Note slot4..slot15 are reported regardless of how many boxes are attached — they are padding, not slots, which is why tray count must not be derived from the number of keys here.",
+  "result": {
+    "status": {
+      "multi_color_controller": {
+        "system": {
+          "ready": true,
+          "mode": "local"
+        },
+        "hardware": {
+          "box_count": 1,
+          "connected": true
+        },
+        "slots": {
+          "states": {
+            "slot0": 2,
+            "slot1": 1,
+            "slot2": 1,
+            "slot3": 1,
+            "slot4": 0,
+            "slot5": 0,
+            "slot6": 0,
+            "slot7": 0,
+            "slot8": 0,
+            "slot9": 0,
+            "slot10": 0,
+            "slot11": 0,
+            "slot12": 0,
+            "slot13": 0,
+            "slot14": 0,
+            "slot15": 0
+          }
+        }
+      }
+    }
+  }
+}

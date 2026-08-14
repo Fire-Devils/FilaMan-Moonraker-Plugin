@@ -49,7 +49,7 @@
       "sensor_timeout_seconds": {
         "type": "integer",
         "title": "Confirmation Timeout (seconds)",
-        "description": "How long a pending auto-assign waits for confirmation before it is dropped",
+        "description": "How long a pending auto-assign waits for confirmation before it is dropped. Acts as a floor: a caller asking for longer gets longer.",
         "default": 300,
         "minimum": 10,
         "maximum": 3600
@@ -61,7 +61,7 @@
           "null"
         ],
         "title": "Slot Sensor Object(s)",
-        "description": "Klipper object holding per-slot filament presence, or a list of objects (one per slot). Left empty it is autodetected: multi_color_controller (QIDI BOX), mmu (Happy Hare), AFC_stepper * (AFC).",
+        "description": "Klipper object holding per-slot filament presence, or a list of objects when there is one per slot. Give full object names; wildcards are not expanded. Names are matched case-insensitively. Left empty it is autodetected: multi_color_controller (QIDI BOX), mmu (Happy Hare), or one AFC_stepper <lane> object per lane (AFC).",
         "items": {
           "type": "string"
         }
@@ -69,7 +69,7 @@
       "slot_sensor_states_path": {
         "type": "string",
         "title": "Slot Sensor Path",
-        "description": "Dotted path to the presence data inside the object, e.g. slots.states or gate_status. Filled in by autodetection when left empty."
+        "description": "Dotted path to the presence data inside the object, e.g. slots.states or gate_status. Required whenever slot_sensor_object is set by hand: autodetection fills in the object and the path together, or neither. Leave both empty to autodetect."
       },
       "slot_sensor_per_slot": {
         "type": "boolean",
