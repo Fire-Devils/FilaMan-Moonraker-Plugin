@@ -35,6 +35,48 @@
         "minimum": 1,
         "maximum": 120
       },
+      "auto_assign_confirm": {
+        "type": "string",
+        "title": "Auto-Assign Confirmation",
+        "description": "How a pending auto-assign is confirmed. sensor waits for filament to appear (toolhead sensor, or an AMS/MMU slot sensor which also identifies the slot). immediate assigns at once. off disables pending auto-assign.",
+        "enum": [
+          "sensor",
+          "immediate",
+          "off"
+        ],
+        "default": "sensor"
+      },
+      "sensor_timeout_seconds": {
+        "type": "integer",
+        "title": "Confirmation Timeout (seconds)",
+        "description": "How long a pending auto-assign waits for confirmation before it is dropped. Acts as a floor: a caller asking for longer gets longer.",
+        "default": 300,
+        "minimum": 10,
+        "maximum": 3600
+      },
+      "slot_sensor_object": {
+        "type": [
+          "string",
+          "array",
+          "null"
+        ],
+        "title": "Slot Sensor Object(s)",
+        "description": "Klipper object holding per-slot filament presence, or a list of objects when there is one per slot. Give full object names; wildcards are not expanded. Names are matched case-insensitively. Left empty it is autodetected: multi_color_controller (QIDI BOX), mmu (Happy Hare), or one AFC_stepper <lane> object per lane (AFC).",
+        "items": {
+          "type": "string"
+        }
+      },
+      "slot_sensor_states_path": {
+        "type": "string",
+        "title": "Slot Sensor Path",
+        "description": "Dotted path to the presence data inside the object, e.g. slots.states or gate_status. Required whenever slot_sensor_object is set by hand: autodetection fills in the object and the path together, or neither. Leave both empty to autodetect."
+      },
+      "slot_sensor_per_slot": {
+        "type": "boolean",
+        "title": "One Sensor Object Per Slot",
+        "description": "Set when slot_sensor_object lists one object per slot (AFC) rather than a single object mapping all of them (QIDI, Happy Hare). Autodetection sets this itself.",
+        "default": false
+      },
       "slot_targets": {
         "type": "array",
         "title": "Tray Targets",
