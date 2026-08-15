@@ -23,6 +23,11 @@ Driver plugin for FilaMan that forwards spool assignments to Moonraker's
 1. Zip the folder `moonraker_filaman`.
 2. Upload/install the zip in FilaMan plugin manager.
 3. Create or edit a printer using driver key `moonraker_filaman`.
+4. Install the Moonraker `filaman` component. Download `filaman.py` from the
+   [FilaMan-Moonraker-Komponente](https://github.com/Fire-Devils/FilaMan-Moonraker-Komponente)
+   repository and place it in `~/printer_data/config/moonraker/extras/filaman.py`, then restart
+   Moonraker. The direct raw link is:
+   `https://github.com/Fire-Devils/FilaMan-Moonraker-Komponente/raw/main/filaman.py`
 
 ## Driver Config
 
