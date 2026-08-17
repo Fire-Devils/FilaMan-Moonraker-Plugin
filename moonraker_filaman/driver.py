@@ -103,6 +103,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _SafeFormatDict(dict):
+    """For str.format_map: an unknown assign_gcode placeholder renders as
+    empty instead of raising KeyError, since templates are user-authored."""
+
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
 class Driver(BaseDriver):
     driver_key = "moonraker_filaman"
 
@@ -1061,7 +1069,12 @@ class Driver(BaseDriver):
     ) -> str:
         material_type = str(filament_data.get("material_type", "PLA"))
         color = str(filament_data.get("color", "FFFFFF")).replace("#", "")[:6]
-        return template.format(
+
+        placeholders: dict[str, Any] = {
+            key: ("" if value is None else value)
+            for key, value in filament_data.items()
+        }
+        placeholders.update(
             spool_id=spool_id,
             ams_id=ams_id,
             tray_id=tray_id,
@@ -1069,6 +1082,7 @@ class Driver(BaseDriver):
             material_type=material_type,
             color=color,
         )
+        return template.format_map(_SafeFormatDict(placeholders))
 
     async def _execute_assign_macro(
         self,
