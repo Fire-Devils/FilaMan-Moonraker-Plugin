@@ -1811,23 +1811,9 @@ class Driver(BaseDriver):
                     await self._complete_pending_assignment(extruder)
                     break
 
-        # A printer-wide active spool cannot name a tray, so on a tray printer it
-        # is not reported from here. health() and the slots_update event still
-        # carry it; this return value is consumed only for slot bookkeeping.
-        #
-        # (Why it matters, verified against filaman-system 1.2.38: both callers
-        # of this return value pass active_spool_id into _handle_slots_update()
-        # with an empty slot list, which falls back to writing it into slot 0-0 —
-        # and the web UI polls one of them every few seconds, so it overwrote the
-        # real per-slot map continuously. That is host-application code, not in
-        # this repo, so treat the parenthetical as dated rather than current.)
-        has_tray_slots = any(
-            str(slot.get("slot_kind") or "") == "tray" for slot in self._slots
-        )
-
         return {
             "connected": self._connected,
-            "active_spool_id": None if has_tray_slots else self._active_spool_id,
+            "active_spool_id": self._active_spool_id,
             "extruder_spools": extruder_spools,
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,

@@ -130,9 +130,10 @@ Slot-sensor state is reported in the driver health payload (`slot_sensor_objects
 `slot_sensor_states_path`, `slot_sensor_autodetected`, `slot_sensor_present`). A misconfigured
 object or path warns once rather than every poll.
 
-Note that on a printer with tray slots the driver does not report a printer-wide `active_spool_id`
-from its status refresh — that value cannot name a tray, and reporting it caused it to be recorded
-against the first slot. It is still present in the health payload.
+FilaMan System 1.2.39 and newer distinguish a printer-wide active spool from per-slot assignments,
+so the driver reports `active_spool_id` for both single-slot and tray printers. Update FilaMan System
+before using this driver with tray slots: older releases could record that value against the first
+slot and overwrite its real assignment.
 
 ## Placeholders for `assign_gcode`
 
