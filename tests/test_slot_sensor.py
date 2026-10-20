@@ -42,6 +42,7 @@ WANTED = {
     "_sensor_baseline_from_slots",
     "_release_blockers",
     "_handle_vacated_slots",
+    "refresh_status",
     "_find_slot",
     "_slot_to_ids",
     "_dig",
@@ -340,6 +341,52 @@ for value, expected in [(-1, True), (-0.5, True), (0, False), (2, False),
     failures += not ok
     print(f"[{'ok ' if ok else 'FAIL'}] unknown? {value!r} -> {got!r}"
           + ("" if ok else f" (expected {expected!r})"))
+
+
+# ---- status refresh ------------------------------------------------------
+# FilaMan System 1.2.39 fixed the host-side fallback that stamped a
+# printer-wide active spool into slot 0-0 on multi-slot printers. The driver
+# must therefore report the value for tray printers too; suppressing it here
+# hides valid printer status from current hosts.
+class RefreshFake(Probe):
+    def __init__(self, slots):
+        self._slots = slots
+        self._active_spool_id = None
+        self._filament_present = {}
+        self._pending = None
+        self._auto_assign_confirm = "sensor"
+
+    async def _request(self, method, path):
+        return {
+            "result": {
+                "filaman_connected": True,
+                "spool_id": 42,
+                "extruder_spools": {},
+                "filament_present": {},
+                "last_error": None,
+                "last_success_at": "2026-08-17T16:23:47Z",
+            }
+        }
+
+    @staticmethod
+    def _unwrap_result(payload):
+        return payload.get("result", payload)
+
+    def _apply_extruder_spools(self, extruder_spools):
+        return False
+
+    def _emit_slots_update(self):
+        pass
+
+
+for label, slots in [("tray printer", TRAYS_DISCOVERED),
+                     ("toolhead-only printer", TOOLHEAD_ONLY)]:
+    status = asyncio.run(RefreshFake(slots).refresh_status())
+    got = status["active_spool_id"]
+    ok = got == 42
+    failures += not ok
+    print(f"[{'ok ' if ok else 'FAIL'}] status: {label} reports active spool {got!r}"
+          + ("" if ok else " (expected 42)"))
 
 # ---- release gating -------------------------------------------------------
 # Live shapes from the printer, 2026-08-14. The box reports these next to the
