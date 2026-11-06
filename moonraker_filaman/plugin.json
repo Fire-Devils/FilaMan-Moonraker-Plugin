@@ -1,4 +1,5 @@
 {
+  "icon": "icon.svg",
   "plugin_key": "moonraker_filaman",
   "name": "Moonraker FilaMan",
   "driver_key": "moonraker_filaman",
