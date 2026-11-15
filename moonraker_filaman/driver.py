@@ -7,17 +7,19 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import quote, urlparse
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_session_maker
 from app.models.location import Location
 from app.models.printer import Printer
 from app.models.printer_params import SpoolPrinterParam
-from app.models.spool import Spool
+from app.models.spool import Spool, SpoolStatus
 from app.plugins.base import BaseDriver
 from app.services.spool_service import SpoolService
 
 logger = logging.getLogger(__name__)
+SLOT_LOCATION_OWNER = "moonraker_filaman_plugin"
 
 # Object-name prefixes for the multi-material add-ons. Slot-sensor detection and
 # tray discovery both key off these; they used to spell the AFC one differently
@@ -1338,11 +1340,47 @@ class Driver(BaseDriver):
         self._spool_original_known.add(spool_id)
         self._spool_original_location[spool_id] = location_id
 
+    def _slot_location_prefix(self) -> str:
+        return f"moonraker_{self.printer_id}_"
+
     def _slot_location_identifier(self, slot_index: str) -> str:
         safe_slot = re.sub(r"[^A-Za-z0-9_-]", "_", slot_index).strip("_")
         if not safe_slot:
             safe_slot = "slot"
-        return f"moonraker_{self.printer_id}_{safe_slot}"[:100]
+        return f"{self._slot_location_prefix()}{safe_slot}"[:100]
+
+    def _owns_slot_location(self, location: Location, slot_index: str) -> bool:
+        fields = location.custom_fields
+        if (
+            not isinstance(fields, dict)
+            or type(fields.get("printer_id")) is not int
+            or fields["printer_id"] != self.printer_id
+            or fields.get("slot_index") != slot_index
+        ):
+            return False
+        if fields.get("managed_by") == SLOT_LOCATION_OWNER:
+            return (location.identifier or "").startswith(self._slot_location_prefix())
+        return (
+            fields.get("managed_by") == self.driver_key
+            and location.identifier == self._slot_location_identifier(slot_index)
+        )
+
+    async def _slot_locations(self, db: AsyncSession, *, lock: bool = False) -> list[Location]:
+        query = (
+            select(Location)
+            .where(
+                func.lower(func.trim(Location.identifier)).startswith(
+                    self._slot_location_prefix(), autoescape=True
+                )
+            )
+            .order_by(Location.id.asc())
+        )
+        if lock:
+            # SQLite ignores FOR UPDATE. Lock writers before reading the JSON.
+            if db.get_bind().dialect.name == "sqlite":
+                await db.execute(text("BEGIN IMMEDIATE"))
+            query = query.with_for_update()
+        return list(await db.scalars(query))
 
     def _slot_display_name(self, slot_index: str) -> str:
         slot = next(
@@ -1423,6 +1461,7 @@ class Driver(BaseDriver):
 
         try:
             async with async_session_maker() as db:
+                locations = await self._slot_locations(db, lock=True)
                 spool = await db.get(Spool, spool_id)
                 if spool is None:
                     logger.warning(
@@ -1431,25 +1470,30 @@ class Driver(BaseDriver):
                     )
                     return False
 
-                result = await db.execute(
-                    select(Location)
-                    .where(Location.identifier == slot_location_identifier)
-                    .order_by(Location.id.asc())
-                    .limit(1)
+                location = next(
+                    (item for item in locations if self._owns_slot_location(item, slot_index)),
+                    None,
                 )
-                location = result.scalars().first()
 
                 location_changed = False
                 desired_custom_fields = {
-                    "managed_by": "moonraker_filaman",
+                    "managed_by": SLOT_LOCATION_OWNER,
                     "printer_id": self.printer_id,
                     "slot_index": slot_index,
                 }
 
                 if location is None:
+                    # FilaMan looks up location tags without case or surrounding spaces.
+                    taken = {item.identifier.strip().lower() for item in locations if item.identifier}
+                    identifier = slot_location_identifier
+                    suffix_number = 2
+                    while identifier.lower() in taken:
+                        suffix = f"-{suffix_number}"
+                        identifier = f"{slot_location_identifier[:100 - len(suffix)]}{suffix}"
+                        suffix_number += 1
                     location = Location(
                         name=slot_location_name,
-                        identifier=slot_location_identifier,
+                        identifier=identifier,
                         custom_fields=desired_custom_fields,
                     )
                     db.add(location)
@@ -1458,10 +1502,6 @@ class Driver(BaseDriver):
                 else:
                     if location.name != slot_location_name:
                         location.name = slot_location_name
-                        location_changed = True
-
-                    if location.identifier != slot_location_identifier:
-                        location.identifier = slot_location_identifier
                         location_changed = True
 
                     merged_custom_fields = {
@@ -1503,6 +1543,23 @@ class Driver(BaseDriver):
             )
         return False
 
+    async def _mark_legacy_slot_locations(self) -> None:
+        """Protect existing slots, including empty ones, without moving spools."""
+        async with async_session_maker() as db:
+            for location in await self._slot_locations(db, lock=True):
+                fields = location.custom_fields
+                if not isinstance(fields, dict):
+                    continue
+                slot_index = fields.get("slot_index")
+                if (
+                    fields.get("managed_by") == self.driver_key
+                    and isinstance(slot_index, str)
+                    and slot_index
+                    and self._owns_slot_location(location, slot_index)
+                ):
+                    location.custom_fields = {**fields, "managed_by": SLOT_LOCATION_OWNER}
+            await db.commit()
+
     async def _restore_slots_from_locations(self) -> None:
         """Rebuild per-slot spool ownership from persisted spool locations.
 
@@ -1527,35 +1584,33 @@ class Driver(BaseDriver):
             return
 
         async with session as db:
+            try:
+                locations = await self._slot_locations(db)
+            except Exception:
+                logger.warning("Could not read slot locations for printer %s", self.printer_id, exc_info=True)
+                return
             for slot in self._slots:
                 slot_index = str(slot.get("slot_index") or "")
                 if not slot_index or slot.get("spool_id") is not None:
                     continue
                 try:
-                    identifier = self._slot_location_identifier(slot_index)
-                    query = (
-                        select(Spool)
-                        .join(Location, Spool.location_id == Location.id)
-                        .where(Location.identifier == identifier)
-                        .order_by(Spool.id.desc())
-                        .limit(1)
-                    )
-                    # `archived` is the host application's column, not ours; if it
-                    # is ever renamed the filter drops rather than crashing, so
-                    # say when that happens instead of silently restoring
-                    # archived spools into slots.
-                    archived = getattr(Spool, "archived", None)
-                    if archived is not None:
-                        query = query.where(archived.is_(False))
-                    else:
-                        self._warn_once(
-                            "spool_archived_missing",
-                            "Spool model has no 'archived' column; archived spools "
-                            "may be restored into slots on printer %s",
-                            self.printer_id,
+                    location_ids = [
+                        location.id for location in locations
+                        if self._owns_slot_location(location, slot_index)
+                    ]
+                    if not location_ids:
+                        continue
+                    rows = (
+                        await db.scalars(
+                            select(Spool)
+                            .where(
+                                Spool.location_id.in_(location_ids),
+                                Spool.status.has(SpoolStatus.key != "archived"),
+                            )
+                            .order_by(Spool.id.desc())
+                            .limit(2)
                         )
-
-                    rows = (await db.execute(query.limit(2))).scalars().all()
+                    ).all()
                     if not rows:
                         continue
                     if len(rows) > 1:
@@ -1597,14 +1652,13 @@ class Driver(BaseDriver):
         Only ever clears a location that IS this slot's; anything else belongs
         to the host application and overwriting it would be guesswork.
         """
-        identifier = self._slot_location_identifier(slot_index)
         try:
             async with async_session_maker() as db:
                 spool = await db.get(Spool, spool_id)
                 if spool is None or spool.location_id is None:
                     return
                 location = await db.get(Location, spool.location_id)
-                if location is None or location.identifier != identifier:
+                if location is None or not self._owns_slot_location(location, slot_index):
                     return
                 await SpoolService(db).move_location(
                     spool,
@@ -1673,6 +1727,7 @@ class Driver(BaseDriver):
 
     async def start(self) -> None:
         self._validate_url()
+        await self._mark_legacy_slot_locations()
         self._running = True
         await self._load_printer_name()
         await self._load_original_location_cache()
